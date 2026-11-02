@@ -1,0 +1,1 @@
+export { I18nProvider, RTL_LANGS, createCollator, createDateFormatter, createDefaultLocale, createFilter, createNumberFormatter, getDefaultLocale, getReadingDirection, isRTL, useLocale } from '../chunk/7TPOQ36Z.js';
