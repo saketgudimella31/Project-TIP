@@ -1,0 +1,101 @@
+{
+  "info": {
+    "name": "TIP frontend/backend integration",
+    "description": "Local orchestration API. No gateway or Jira credentials belong in this collection.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8000/api/v1" },
+    { "key": "taskId", "value": "" },
+    { "key": "repoId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+    },
+    {
+      "name": "Configuration capabilities",
+      "request": { "method": "GET", "url": "{{baseUrl}}/configuration" }
+    },
+    {
+      "name": "Analyze manual user story",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Accepted', function () { pm.response.to.have.status(202); });",
+          "if (pm.response.code === 202) pm.collectionVariables.set('taskId', pm.response.json().task_id);"
+        ] }
+      }],
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/analysis",
+        "body": {
+          "mode": "formdata",
+          "formdata": [{
+            "key": "options",
+            "type": "text",
+            "value": "{\"target_application\":\"Orders\",\"analysis_mode\":\"INCREMENTAL\",\"code_source\":\"uploads\",\"manual_stories\":[{\"id\":\"US-001\",\"title\":\"View order status\",\"description\":\"As a customer, I want to view the status of my order.\",\"acceptanceCriteria\":\"The order detail view displays the current status.\",\"priority\":null}]}"
+          }]
+        }
+      }
+    },
+    {
+      "name": "Analyze uploaded code, Excel and Word (choose files first)",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Accepted', function () { pm.response.to.have.status(202); });",
+          "if (pm.response.code === 202) pm.collectionVariables.set('taskId', pm.response.json().task_id);"
+        ] }
+      }],
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/analysis",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "options", "type": "text", "value": "{\"target_application\":\"My Application\",\"analysis_mode\":\"INCREMENTAL\",\"code_source\":\"uploads\"}" },
+            { "key": "code_files", "type": "file", "src": [] },
+            { "key": "requirements_files", "type": "file", "src": [] },
+            { "key": "design_files", "type": "file", "src": [] }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Poll current task",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Task exists', function () { pm.response.to.have.status(200); });",
+          "if (pm.response.code === 200) {",
+          "  const task = pm.response.json();",
+          "  if (task.result && task.result.repo_id) pm.collectionVariables.set('repoId', task.result.repo_id);",
+          "}"
+        ] }
+      }],
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}" }
+    },
+    {
+      "name": "Get completed structured analysis",
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/analysis" }
+    },
+    {
+      "name": "Download completed Word (Send and Download)",
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/document" }
+    },
+    {
+      "name": "Cancel current task",
+      "request": { "method": "POST", "url": "{{baseUrl}}/tasks/{{taskId}}/cancel" }
+    },
+    {
+      "name": "List tasks",
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks?limit=100" }
+    },
+    {
+      "name": "Retrieve indexed source context",
+      "request": { "method": "GET", "url": "{{baseUrl}}/context/pack?repoId={{repoId}}&focus=order&budget=12000" }
+    }
+  ]
+}

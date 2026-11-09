@@ -1,0 +1,380 @@
+import fnmatch
+import hashlib
+import io
+import json
+import re
+import subprocess
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.datastructures import UploadFile
+
+from .config import Settings
+from .extraction import Extractor, safe_path, source_directory
+from .gateway import Gateway
+from .models import AnalysisOptions
+from .service import TaskManager, Upload, repo_identifier
+from .storage import Store
+
+
+class IngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    repo_url: str | None = None
+    local_path: str | None = None
+    branch: str | None = None
+    mode: str = "full"
+    include_globs: list[str] = Field(default_factory=list)
+    exclude_globs: list[str] = Field(default_factory=list)
+    since_commit: str | None = None
+    repo_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ProcessDocumentRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=150_000)
+    filename: str = "document.txt"
+    document_type: str = "CODE"
+
+
+class ProcessDirectoryRequest(BaseModel):
+    directory_path: str
+    file_patterns: list[str] = Field(default_factory=list)
+    recursive: bool = True
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    config = settings or Settings()
+    store = Store(config.data_dir / "tip.sqlite3")
+    manager = TaskManager(config, store, Gateway(config))
+
+    @asynccontextmanager
+    async def lifespan(app):
+        store.recover()
+        yield
+        manager.close()
+
+    app = FastAPI(title="Test Intelligence Platform", version="1.0.0", lifespan=lifespan)
+    app.state.manager = manager
+    app.state.store = store
+
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        # This package is a single-user local service, not an unauthenticated LAN API.
+        host = request.headers.get("host", "").split(":")[0]
+        if host not in {"localhost", "127.0.0.1", "testserver"}:
+            return JSONResponse({"detail": "Local-only service: use localhost"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(origin)
+            if parsed.hostname not in {"localhost", "127.0.0.1"}:
+                return JSONResponse({"detail": "Cross-site requests are not allowed"}, status_code=403)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/v1/health")
+    def health():
+        return {
+            "status": "healthy",
+            "services": {
+                "storage": True, "local_retrieval": True,
+                "task_queue": True,
+                "graph_service": bool(config.rag_base_url),
+                "sqlite_connected": store.verify_connectivity(),
+                "analysis_persistence": store.verify_connectivity(),
+                "gateway_configured": bool(config.gateway_url),
+                "gateway_auth_configured": config.gateway_auth_configured,
+                "rag_configured": bool(config.rag_base_url),
+                "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
+                "uml_renderer_configured": bool(config.plantuml_jar and config.plantuml_jar.is_file()),
+            },
+            "version": "1.0.0",
+        }
+
+    @app.get("/api/v1/configuration")
+    def configuration():
+        return {
+            "gateway_configured": bool(config.gateway_url),
+            "gateway_auth_configured": config.gateway_auth_configured,
+            "rag_configured": bool(config.rag_base_url),
+            "persistence_configured": store.verify_connectivity(),
+            "persistence_backend": "SQLite",
+            "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
+            "server_directories_enabled": config.local_source_root is not None,
+            "max_upload_bytes": config.max_upload_bytes,
+            "max_files": config.max_files,
+            "single_user_local_only": True,
+        }
+
+    @app.get("/api/v1/metrics", response_class=Response)
+    def metrics():
+        return Response(store.metrics(), media_type="text/plain")
+
+    def submit(metadata, operation):
+        try:
+            task = manager.submit(metadata, operation)
+        except ValueError as error:
+            raise HTTPException(429, str(error)) from error
+        return {"task_id": task["task_id"], "status": task["status"], "message": "Queued"}
+
+    @app.post("/api/v1/analysis", status_code=202)
+    async def analysis(request: Request):
+        if not config.gateway_url:
+            raise HTTPException(
+                503, "Configure TIP_GATEWAY_URL with the complete completion endpoint before analysis"
+            )
+        if not store.verify_connectivity():
+            raise HTTPException(503, "SQLite analysis storage is unavailable; analysis was not sent to the model")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > config.max_upload_bytes + 1_000_000:
+                    raise HTTPException(413, "Combined upload exceeds the size limit")
+            except ValueError as error:
+                raise HTTPException(400, "Invalid Content-Length") from error
+        kinds = {
+            "code_files": "CODE", "design_files": "DESIGN_DOCUMENT",
+            "requirements_files": "RAW_REQUIREMENT", "story_files": "JIRA_USER_STORY",
+        }
+        async with request.form(
+            max_files=config.max_files, max_fields=10, max_part_size=200_000
+        ) as form:
+            try:
+                options = AnalysisOptions.model_validate_json(str(form.get("options", "")))
+            except ValidationError as error:
+                raise HTTPException(422, [
+                    {"loc": list(e["loc"]), "msg": e["msg"]} for e in error.errors()
+                ]) from error
+            uploads = []
+            total = 0
+            for name, value in form.multi_items():
+                if name == "options":
+                    continue
+                if name not in kinds or not isinstance(value, UploadFile):
+                    raise HTTPException(422, f"Unknown upload field: {name}")
+                try:
+                    filename = safe_path(value.filename or "")
+                except ValueError as error:
+                    raise HTTPException(422, str(error)) from error
+                chunks = []
+                while chunk := await value.read(64 * 1024):
+                    total += len(chunk)
+                    if total > config.max_upload_bytes:
+                        raise HTTPException(413, "Combined upload exceeds the size limit")
+                    chunks.append(chunk)
+                uploads.append(Upload(filename, b"".join(chunks), kinds[name]))
+        if not uploads and not options.manual_stories and not options.jira_issue_keys and options.code_source == "uploads":
+            raise HTTPException(422, "NO_ANALYZABLE_INPUT: provide code or supporting evidence")
+        return submit(
+            {"kind": "analysis", "target_application": options.target_application,
+             "mode": options.analysis_mode},
+            lambda task_id: manager.analyze(task_id, options, uploads),
+        )
+
+    @app.get("/api/v1/tasks")
+    def tasks(status: str | None = None, limit: int = Query(default=100, ge=1, le=1000)):
+        if status and status not in {"pending", "running", "success", "failed", "cancelled"}:
+            raise HTTPException(422, "Unknown task status")
+        return store.list_tasks(status, limit)
+
+    def require_task(task_id: str):
+        task = store.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        return task
+
+    @app.get("/api/v1/tasks/{task_id}")
+    def task(task_id: str):
+        return require_task(task_id)
+
+    @app.post("/api/v1/tasks/{task_id}/cancel")
+    def cancel(task_id: str):
+        try:
+            return manager.cancel(task_id)
+        except KeyError as error:
+            raise HTTPException(404, "Task not found") from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+
+    @app.get("/api/v1/tasks/{task_id}/analysis")
+    def analysis_result(task_id: str):
+        task = require_task(task_id)
+        result = task.get("result", {}).get("analysis")
+        if task["status"] != "success" or not result:
+            raise HTTPException(409, "Analysis is not successfully completed")
+        return result
+
+    @app.get("/api/v1/tasks/{task_id}/document")
+    def download(task_id: str):
+        task = require_task(task_id)
+        document = store.document(task_id)
+        if task["status"] != "success" or document is None:
+            raise HTTPException(409, "Word document is not ready")
+        return StreamingResponse(
+            io.BytesIO(document),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="TIP-requirements-{task_id}.docx"'},
+        )
+
+    def filter_files(artifacts, includes, excludes):
+        return [
+            artifact for artifact in artifacts
+            if (not includes or any(fnmatch.fnmatch(artifact.filePath, glob) for glob in includes))
+            and not any(fnmatch.fnmatch(artifact.filePath, glob) for glob in excludes)
+        ]
+
+    @app.post("/api/v1/ingest/repo", status_code=202)
+    def ingest(data: IngestRequest):
+        if bool(data.repo_url) == bool(data.local_path):
+            raise HTTPException(422, "Supply exactly one of repo_url or local_path")
+        if data.mode not in {"full", "incremental"}:
+            raise HTTPException(422, "Mode must be full or incremental")
+        if data.since_commit and not re.fullmatch(r"[a-fA-F0-9]{7,40}", data.since_commit):
+            raise HTTPException(422, "since_commit must be a Git commit SHA")
+        if data.since_commit and data.mode != "incremental":
+            raise HTTPException(422, "since_commit is valid only for incremental ingestion")
+        source = data.repo_url or data.local_path
+        repo_id = data.repo_id or repo_identifier(source)
+
+        def operation(task_id):
+            manager.progress(task_id, 10, "Reading authorized repository source")
+            extractor = Extractor(config)
+            with source_directory(
+                config, repo_url=data.repo_url, local_path=data.local_path, branch=data.branch
+            ) as root:
+                artifacts = extractor.directory(root)
+                if data.since_commit:
+                    # Incremental requests still rebuild the complete current index. This
+                    # removes deleted files reliably while reporting the actual change count.
+                    if data.repo_url:
+                        fetched = subprocess.run(
+                            ["git", "-C", str(root), "fetch", "--depth=1", "origin", data.since_commit],
+                            capture_output=True, timeout=120, check=False,
+                        )
+                        if fetched.returncode:
+                            raise ValueError("Cannot retrieve the requested since_commit")
+                    changed = subprocess.run(
+                        ["git", "-C", str(root), "diff", "--name-only", data.since_commit, "HEAD"],
+                        capture_output=True, timeout=30, check=False,
+                    )
+                    if changed.returncode:
+                        raise ValueError("Cannot compare the requested since_commit")
+                    changed_count = len(changed.stdout.decode("utf-8").splitlines())
+                else:
+                    changed_count = None
+            artifacts = filter_files(artifacts, data.include_globs, data.exclude_globs)
+            manager.progress(task_id, 70, "Indexing readable source content")
+            manager.check(task_id)
+            store.index(repo_id, artifacts)
+            return {
+                "repo_id": repo_id, "files_processed": len(artifacts), "mode": data.mode,
+                "changed_files_count": changed_count,
+                "warnings": extractor.warnings,
+                "excluded_files": extractor.excluded_files,
+                "unsupported_files": extractor.unsupported_files,
+                "index_strategy": "current_scope_snapshot",
+            }, None
+
+        return {**submit({"kind": "ingest", "repo_url": data.repo_url, "mode": data.mode}, operation),
+                "repo_id": repo_id}
+
+    @app.post("/api/v1/documents/process", status_code=202)
+    def process_document(data: ProcessDocumentRequest):
+        if data.document_type not in {"CODE", "DESIGN_DOCUMENT", "JIRA_USER_STORY", "RAW_REQUIREMENT"}:
+            raise HTTPException(422, "Unknown document_type")
+
+        def operation(task_id):
+            manager.progress(task_id, 20, "Normalizing supplied document text")
+            extractor = Extractor(config)
+            name = safe_path(data.filename)
+            artifact = extractor.artifact(
+                data.document_type, name, data.content,
+                **({"filePath": name, "sha256": hashlib.sha256(data.content.encode()).hexdigest()}
+                   if data.document_type == "CODE" else {}),
+            )
+            repo_id = repo_identifier(name)
+            if artifact.sourceType == "CODE":
+                store.index(repo_id, [artifact])
+            return {"files_processed": 1, "repo_id": repo_id,
+                    "artifacts": [artifact.model_dump()]}, None
+        return submit({"kind": "document", "filename": data.filename}, operation)
+
+    @app.post("/api/v1/documents/process-directory", status_code=202)
+    def process_directory(data: ProcessDirectoryRequest):
+        def operation(task_id):
+            manager.progress(task_id, 20, "Reading allowed server directory")
+            extractor = Extractor(config)
+            with source_directory(config, local_path=data.directory_path) as root:
+                artifacts = extractor.directory(root)
+            if not data.recursive:
+                artifacts = [a for a in artifacts if "/" not in a.filePath]
+            artifacts = filter_files(artifacts, data.file_patterns, [])
+            repo_id = repo_identifier(data.directory_path)
+            store.index(repo_id, artifacts)
+            return {"repo_id": repo_id, "files_processed": len(artifacts),
+                    "warnings": extractor.warnings,
+                    "unsupported_files": extractor.unsupported_files}, None
+        return submit({"kind": "directory", "local_path": data.directory_path}, operation)
+
+    @app.get("/api/v1/graph/related")
+    def related(query: str, repoId: str, limit: int = Query(default=10, ge=1, le=100)):
+        artifacts = store.retrieve(repoId, query, limit)
+        return {
+            "query": query, "repo_id": repoId,
+            "nodes": [
+                {"type": "FILE", "ref": a.filePath, "path": a.filePath,
+                 "lang": Path(a.filePath).suffix.lstrip("."), "score": 1 / (i + 1),
+                 "summary": a.content[:1000]}
+                for i, a in enumerate(artifacts)
+            ],
+        }
+
+    @app.get("/api/v1/context/pack")
+    def context_pack(repoId: str, stage: str = "requirements",
+                     budget: int = Query(default=12000, ge=100, le=100_000),
+                     keywords: str = "", focus: str = ""):
+        # Budget is a character budget, not a claimed tokenizer-specific token count.
+        artifacts = store.retrieve(repoId, focus or keywords, config.max_files)
+        items = []
+        used = 0
+        for artifact in artifacts:
+            remaining = budget - used
+            if remaining <= 0:
+                break
+            summary = artifact.content[:remaining]
+            used += len(summary)
+            items.append({
+                "kind": "CODE", "title": artifact.sourceName, "summary": summary,
+                "ref": artifact.filePath,
+                "extra": {"path": artifact.filePath, "budget_unit": "characters"},
+            })
+        return {
+            "items": items, "budget_used": used, "budget_limit": budget,
+            "stage": stage, "repo_id": repoId, "category_counts": {"CODE": len(items)},
+        }
+
+    @app.get("/api/v1/graph/impact")
+    def impact(repoId: str, file: str, depth: int = 2, limit: int = 20):
+        if not config.rag_base_url:
+            raise HTTPException(
+                501, "Dependency impact requires your existing graph/RAG service; "
+                "local full-text retrieval cannot infer dependency relationships"
+            )
+        try:
+            with httpx.Client(timeout=30, follow_redirects=False) as client:
+                response = client.get(
+                    f"{config.rag_base_url}/graph/impact",
+                    params={"repoId": repoId, "file": file, "depth": depth, "limit": limit},
+                )
+            if response.status_code != 200:
+                raise HTTPException(502, f"Graph service returned HTTP {response.status_code}")
+            return response.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as error:
+            raise HTTPException(502, "Graph service returned an invalid response or is unavailable") from error
+
+    return app

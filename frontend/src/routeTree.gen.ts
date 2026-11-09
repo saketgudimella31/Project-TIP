@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as MetricsRouteImport } from './routes/metrics'
 import { Route as RepositoriesRouteImport } from './routes/repositories'
+import { Route as RequirementsRouteImport } from './routes/requirements'
 import { Route as TasksRouteImport } from './routes/tasks'
 
 const IndexRoute = IndexRouteImport.update({
@@ -29,6 +30,11 @@ const RepositoriesRoute = RepositoriesRouteImport.update({
   path: '/repositories',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RequirementsRoute = RequirementsRouteImport.update({
+  id: '/requirements',
+  path: '/requirements',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const TasksRoute = TasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
@@ -39,12 +45,14 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/metrics': typeof MetricsRoute
   '/repositories': typeof RepositoriesRoute
+  '/requirements': typeof RequirementsRoute
   '/tasks': typeof TasksRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/metrics': typeof MetricsRoute
   '/repositories': typeof RepositoriesRoute
+  '/requirements': typeof RequirementsRoute
   '/tasks': typeof TasksRoute
 }
 export interface FileRoutesById {
@@ -52,20 +60,23 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/metrics': typeof MetricsRoute
   '/repositories': typeof RepositoriesRoute
+  '/requirements': typeof RequirementsRoute
   '/tasks': typeof TasksRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/metrics' | '/repositories' | '/tasks'
+  fullPaths: '/' | '/metrics' | '/repositories' | '/requirements' | '/tasks'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/metrics' | '/repositories' | '/tasks'
-  id: '__root__' | '/' | '/metrics' | '/repositories' | '/tasks'
+  to: '/' | '/metrics' | '/repositories' | '/requirements' | '/tasks'
+  id:
+    '__root__' | '/' | '/metrics' | '/repositories' | '/requirements' | '/tasks'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   MetricsRoute: typeof MetricsRoute
   RepositoriesRoute: typeof RepositoriesRoute
+  RequirementsRoute: typeof RequirementsRoute
   TasksRoute: typeof TasksRoute
 }
 
@@ -92,6 +103,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RepositoriesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/requirements': {
+      id: '/requirements'
+      path: '/requirements'
+      fullPath: '/requirements'
+      preLoaderRoute: typeof RequirementsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/tasks': {
       id: '/tasks'
       path: '/tasks'
@@ -106,6 +124,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   MetricsRoute: MetricsRoute,
   RepositoriesRoute: RepositoriesRoute,
+  RequirementsRoute: RequirementsRoute,
   TasksRoute: TasksRoute,
 }
 export const routeTree = rootRouteImport

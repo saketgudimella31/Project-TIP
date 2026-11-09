@@ -1,63 +1,32 @@
 import { createRootRouteWithContext, Link, Outlet } from '@tanstack/react-router'
-import { QueryClient } from '@tanstack/react-query'
+import type { QueryClient } from '@tanstack/react-query'
 import { Activity, Database, Home, ListTodo } from 'lucide-react'
 
-interface RouterContext {
-  queryClient: QueryClient
-}
+const navigation = [
+  { to: '/', label: 'Dashboard', icon: Home },
+  { to: '/tasks', label: 'Tasks', icon: ListTodo },
+  { to: '/repositories', label: 'Repositories', icon: Database },
+  { to: '/metrics', label: 'Metrics', icon: Activity },
+] as const
 
-export const Route = createRootRouteWithContext<RouterContext>()({
-  component: RootComponent,
-})
-
-function RootComponent() {
-  return (
-    <div className="min-h-screen bg-background">
-      {/* Navigation */}
-      <nav className="border-b">
-        <div className="container mx-auto px-4 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-6">
-              <h1 className="text-xl font-bold">Test Intelligence Platform</h1>
-              <div className="flex space-x-1">
-                <Link
-                  to="/"
-                  className="px-3 py-2 rounded-md text-sm font-medium hover:bg-accent [&.active]:bg-accent"
-                >
-                  <Home className="inline-block w-4 h-4 mr-2" />
-                  Dashboard
-                </Link>
-                <Link
-                  to="/tasks"
-                  className="px-3 py-2 rounded-md text-sm font-medium hover:bg-accent [&.active]:bg-accent"
-                >
-                  <ListTodo className="inline-block w-4 h-4 mr-2" />
-                  Tasks
-                </Link>
-                <Link
-                  to="/repositories"
-                  className="px-3 py-2 rounded-md text-sm font-medium hover:bg-accent [&.active]:bg-accent"
-                >
-                  <Database className="inline-block w-4 h-4 mr-2" />
-                  Repositories
-                </Link>
-                <Link
-                  to="/metrics"
-                  className="px-3 py-2 rounded-md text-sm font-medium hover:bg-accent [&.active]:bg-accent"
-                >
-                  <Activity className="inline-block w-4 h-4 mr-2" />
-                  Metrics
-                </Link>
-              </div>
-            </div>
+export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
+  component: () => (
+    <div className="min-h-screen">
+      <nav className="border-b bg-white" aria-label="Main navigation">
+        <div className="mx-auto max-w-screen-2xl px-4 py-3 sm:px-8 flex flex-wrap items-center gap-x-6 gap-y-3">
+          <h1 className="text-xl font-bold">Test Intelligence Platform</h1>
+          <div className="flex flex-wrap gap-1 text-sm">
+            {navigation.map(({ to, label, icon: Icon }) => (
+              <Link key={to} to={to} activeOptions={{ exact: to === '/' }}
+                className="inline-flex items-center gap-2 rounded-md px-3 py-2 hover:bg-accent"
+                activeProps={{ className: 'ring-2 ring-amber-500' }}>
+                <Icon className="h-4 w-4" aria-hidden="true" />{label}
+              </Link>
+            ))}
           </div>
         </div>
       </nav>
-
-      {/* Main content */}
-      <main className="container mx-auto px-4 py-6">
-        <Outlet />
-      </main>
+      <main className="mx-auto max-w-screen-2xl px-4 py-6 sm:px-8"><Outlet /></main>
     </div>
-  )
-}
+  ),
+})

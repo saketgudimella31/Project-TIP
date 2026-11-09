@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #000000;
+  --color-card: #ffffff;
+  --color-card-foreground: #000000;
+  --color-primary: #ffffff;
+  --color-primary-foreground: #000000;
+  --color-secondary: #e2e8f0;
+  --color-secondary-foreground: #0f172a;
+  --color-muted-foreground: #000000;
+  --color-accent: #f5f5f5;
+  --color-input: #000000;
+  --color-ring: #f59e0b;
+  --color-destructive: #b91c1c;
+}
+
+@layer base {
+  body { margin: 0; font-family: Arial, Helvetica, sans-serif; background: var(--color-background); color: var(--color-foreground); }
+  * { border-color: #000000; }
+  button, summary, select { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--color-ring); outline-offset: 3px; }
+}
