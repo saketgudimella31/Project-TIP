@@ -9,6 +9,7 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from typing import Iterator
 from urllib.parse import urlsplit
 
 import httpx
@@ -34,6 +35,7 @@ EXCLUDED_NAMES = {
     ".env", ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "credentials",
     "package-lock.json", "bun.lock", "yarn.lock", "pnpm-lock.yaml",
 }
+MAX_DIAGNOSTIC_ENTRIES = 100
 
 
 def safe_path(name: str) -> str:
@@ -96,9 +98,39 @@ class Extractor:
         self.warnings: list[str] = []
         self.excluded_files: list[str] = []
         self.unsupported_files: list[str] = []
+        self.warning_count = 0
+        self.excluded_count = 0
+        self.unsupported_count = 0
         self.seen: set[tuple[str, str, str | None, int | None]] = set()
         self.file_count = 0
         self.expanded_bytes = 0
+
+    @staticmethod
+    def _remember(items: list[str], value: str):
+        if len(items) < MAX_DIAGNOSTIC_ENTRIES:
+            items.append(value)
+
+    def _exclude(self, name: str):
+        self.excluded_count += 1
+        self._remember(self.excluded_files, name)
+
+    def _unsupported(self, name: str):
+        self.unsupported_count += 1
+        self._remember(self.unsupported_files, name)
+
+    def _warn(self, message: str):
+        self.warning_count += 1
+        self._remember(self.warnings, message)
+
+    def _count_source(
+        self, byte_count: int, file_limit: int | None, byte_limit: int | None,
+    ):
+        self.file_count += 1
+        self.expanded_bytes += byte_count
+        if self.file_count > (file_limit or self.settings.max_files):
+            raise ValueError("Too many source files")
+        if self.expanded_bytes > (byte_limit or self.settings.max_extracted_bytes):
+            raise ValueError("Combined expanded artifacts exceed the size limit")
 
     def artifact(self, source_type: SourceType, name: str, content: str, **metadata) -> Artifact:
         if not content.strip() or content.strip() in {
@@ -116,16 +148,14 @@ class Extractor:
         self.seen.add(identity)
         return Artifact(sourceType=source_type, sourceName=name, content=content, **metadata)
 
-    def extract(self, name: str, data: bytes, kind: SourceType = "CODE") -> list[Artifact]:
+    def extract(
+        self, name: str, data: bytes, kind: SourceType = "CODE",
+        *, file_limit: int | None = None, byte_limit: int | None = None,
+    ) -> list[Artifact]:
         name = safe_path(name)
-        self.file_count += 1
-        self.expanded_bytes += len(data)
-        if self.file_count > self.settings.max_files:
-            raise ValueError("Too many source files")
-        if self.expanded_bytes > self.settings.max_extracted_bytes:
-            raise ValueError("Combined expanded artifacts exceed the size limit")
+        self._count_source(len(data), file_limit, byte_limit)
         if kind == "CODE" and excluded(name):
-            self.excluded_files.append(name)
+            self._exclude(name)
             return []
         suffix = PurePosixPath(name).suffix.lower()
         if suffix == ".zip" and kind == "CODE":
@@ -136,11 +166,14 @@ class Extractor:
                         continue
                     member_name = safe_path(member.filename)
                     if excluded(member_name):
-                        self.excluded_files.append(member_name)
+                        self._exclude(member_name)
                         continue
                     if PurePosixPath(member_name).suffix.lower() in {".zip", ".tar", ".gz", ".7z"}:
                         raise ValueError("Nested archives are not supported; upload one source ZIP")
-                    result.extend(self.extract(member_name, archive.read(member), kind))
+                    result.extend(self.extract(
+                        member_name, archive.read(member), kind,
+                        file_limit=file_limit, byte_limit=byte_limit,
+                    ))
             return result
         if kind == "DESIGN_DOCUMENT" and suffix == ".docx":
             check_office(data, self.settings)
@@ -166,14 +199,14 @@ class Extractor:
         if kind == "CODE" and suffix not in TEXT_EXTENSIONS and PurePosixPath(name).name not in {
             "Dockerfile", "Makefile", "Jenkinsfile", "Procfile",
         }:
-            self.unsupported_files.append(name)
+            self._unsupported(name)
             return []
         try:
             text = data.decode("utf-8-sig")
         except UnicodeDecodeError as error:
             raise ValueError(f"{name} is not readable UTF-8 text") from error
         if not text.strip():
-            self.warnings.append(f"Empty file omitted: {name}")
+            self._warn(f"Empty file omitted: {name}")
             return []
         metadata = (
             {"filePath": name, "sha256": hashlib.sha256(data).hexdigest()}
@@ -229,21 +262,49 @@ class Extractor:
             story.model_dump_json(), externalId=story.id,
         )
 
-    def directory(self, root: Path, prefix: str = "") -> list[Artifact]:
-        artifacts = []
+    def iter_directory(
+        self, root: Path, prefix: str = "", *,
+        file_limit: int | None = None, byte_limit: int | None = None,
+        recursive: bool = True,
+    ) -> Iterator[Artifact]:
+        file_limit = file_limit or self.settings.max_repository_files
+        byte_limit = byte_limit or self.settings.max_repository_bytes
         for directory, names, files in os.walk(root, followlinks=False):
-            names[:] = sorted(n for n in names if n not in EXCLUDED_DIRS)
+            names[:] = (
+                sorted(n for n in names if n not in EXCLUDED_DIRS) if recursive else []
+            )
             for filename in sorted(files):
                 path = Path(directory) / filename
                 relative = path.relative_to(root).as_posix()
                 if path.is_symlink() or excluded(relative):
-                    self.excluded_files.append(relative)
+                    self._exclude(relative)
                     continue
-                if path.stat().st_size > self.settings.max_upload_bytes:
-                    raise ValueError(f"File too large: {relative}")
                 source_path = (PurePosixPath(prefix) / relative).as_posix()
-                artifacts.extend(self.extract(source_path, path.read_bytes()))
-        return artifacts
+                size = path.stat().st_size
+                if size > self.settings.max_repository_file_bytes:
+                    self._count_source(size, file_limit, byte_limit)
+                    self._unsupported(source_path)
+                    self._warn(f"File exceeds the per-file size limit and was omitted: {source_path}")
+                    continue
+                try:
+                    yield from self.extract(
+                        source_path, path.read_bytes(),
+                        file_limit=file_limit, byte_limit=byte_limit,
+                    )
+                except ValueError as error:
+                    message = str(error)
+                    if (
+                        "per-artifact character limit" in message
+                        or "not readable UTF-8 text" in message
+                        or "binary/control characters" in message
+                    ):
+                        self._unsupported(source_path)
+                        self._warn(f"Unreadable or oversized file was omitted: {source_path}")
+                        continue
+                    raise
+
+    def directory(self, root: Path, prefix: str = "") -> list[Artifact]:
+        return list(self.iter_directory(root, prefix))
 
 
 def adf_text(value) -> str:
@@ -309,7 +370,9 @@ def jira_stories(keys: list[str], settings: Settings, extractor: Extractor) -> l
 def selected_root(root: Path, selected_path: str | None) -> Path:
     if not selected_path:
         return root
-    safe_path(selected_path)
+    selected_path = safe_path(selected_path)
+    if excluded(selected_path):
+        raise ValueError("Selected path is excluded from source analysis")
     selected = (root / selected_path).resolve()
     if not selected.is_relative_to(root.resolve()) or not selected.is_dir():
         raise ValueError("Selected path must be an existing directory inside the source root")
@@ -328,6 +391,11 @@ def source_directory(settings: Settings, *, repo_url=None, local_path=None,
             raise ValueError("Local path is outside TIP_LOCAL_SOURCE_ROOT or is not a directory")
         yield selected_root(root, selected_path)
         return
+    sparse_path = safe_path(selected_path) if selected_path else None
+    if sparse_path == ".":
+        sparse_path = None
+    if sparse_path and excluded(sparse_path):
+        raise ValueError("Selected path is excluded from source analysis")
     url = urlsplit(repo_url or "")
     allowed_hosts = {host.strip().lower() for host in settings.repository_hosts.split(",")}
     if (
@@ -337,24 +405,55 @@ def source_directory(settings: Settings, *, repo_url=None, local_path=None,
         or not re.fullmatch(r"/[A-Za-z0-9._/-]+", url.path)
         or ".." in PurePosixPath(url.path).parts
     ):
-        raise ValueError("Repository must be a credential-free HTTPS URL on an allowed host")
+        raise ValueError(
+            "Repository must be a credential-free HTTPS URL on an allowed host listed in TIP_REPOSITORY_HOSTS"
+        )
     if branch and (branch.startswith("-") or not re.fullmatch(r"[\w./-]+", branch)):
         raise ValueError("Invalid branch name")
+    environment = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+    }
+
+    def run_git(command):
+        try:
+            return subprocess.run(
+                command, capture_output=True,
+                timeout=settings.repository_clone_timeout_seconds,
+                check=False, env=environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                "Repository clone or checkout exceeded the "
+                f"{settings.repository_clone_timeout_seconds}-second timeout"
+            ) from error
+
     with tempfile.TemporaryDirectory(prefix="tip-repo-") as directory:
         target = Path(directory) / "source"
         command = [
             "git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=never",
             "clone", "--depth=1", "--single-branch",
         ]
+        if sparse_path:
+            command.extend(["--filter=blob:none", "--no-checkout"])
         if branch:
             command.extend(["--branch", branch])
         command.extend(["--", repo_url, str(target)])
-        process = subprocess.run(
-            command, capture_output=True, timeout=120, check=False,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
-        )
+        process = run_git(command)
         if process.returncode:
             raise ValueError(
                 "Repository clone failed; check URL, branch, and backend Git credentials"
             )
-        yield selected_root(target, selected_path)
+        if sparse_path:
+            checkout_commands = (
+                ["git", "-C", str(target), "sparse-checkout", "init", "--cone"],
+                ["git", "-C", str(target), "sparse-checkout", "set", "--cone", "--", sparse_path],
+                ["git", "-C", str(target), "checkout"],
+            )
+            for checkout_command in checkout_commands:
+                if run_git(checkout_command).returncode:
+                    raise ValueError(
+                        "Repository subdirectory checkout failed; check the path and backend Git version"
+                    )
+        yield selected_root(target, sparse_path)

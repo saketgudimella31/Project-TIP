@@ -15,7 +15,7 @@ function Dashboard() {
   })
   const services = [
     { title: 'SQLite Analysis Storage', icon: Database, state: serviceState(health.data, ['sqlite_connected']), on: 'Connected', off: 'Unavailable' },
-    { title: 'RAG Retrieval', icon: Activity, state: serviceState(health.data, ['local_retrieval']), on: 'Local retrieval available', off: 'Unavailable' },
+    { title: 'Source Retrieval', icon: Activity, state: serviceState(health.data, ['local_retrieval']), on: 'Available', off: 'Unavailable' },
     { title: 'Task Queue', icon: Server, state: serviceState(health.data, ['task_queue', 'celery']), on: 'Running', off: 'Stopped' },
   ]
   return <div className="space-y-6">
@@ -53,7 +53,6 @@ function Dashboard() {
       <p className="text-sm" role="status">
         AI gateway endpoint: {health.data.services.gateway_configured ? 'Configured' : 'Not configured'}
         {' · '}Authentication: {health.data.services.gateway_auth_configured ? 'Configured (not verified)' : 'Not configured'}
-        {' · '}Graph impact: {health.data.services.graph_service ? 'Connected' : 'Not configured'}
       </p>
     )}
     <div className="grid gap-4 md:grid-cols-3">

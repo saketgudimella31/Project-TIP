@@ -74,6 +74,15 @@ export interface AnalysisTask {
   result?: {
     analysis?: Analysis
     files_processed?: number
+    files_indexed?: number
+    files_analyzed?: number
+    repository_coverage?: {
+      indexedCodeFiles: number
+      retrievedCodeFiles: number
+      retrievedCharacters: number
+      selectionMethod: string
+      analysisBatchCount: number
+    } | null
     repo_id?: string
     duration_ms?: number
   }
@@ -82,13 +91,35 @@ export interface AnalysisTask {
 export interface Configuration {
   gateway_configured: boolean
   gateway_auth_configured: boolean
+  analysis_prompts_configured?: boolean
+  analysis_prompt_issue?: string | null
   rag_configured: boolean
   persistence_configured: boolean
   persistence_backend: string
+  graph_backend: 'kuzu' | 'sqlite'
+  graph_configured: boolean
+  retrieval_backend: string
+  graph_limitations: string[]
+  embedding_provider?: 'hash' | 'sentence_transformers'
+  semantic_search?: boolean
+  diagram_renderer_configured?: boolean
   jira_configured: boolean
   server_directories_enabled: boolean
   max_upload_bytes: number
   max_files: number
+  max_artifact_characters: number
+  max_repository_files: number
+  max_repository_bytes: number
+  max_repository_file_bytes: number
+  repository_clone_timeout_seconds: number
+  max_analysis_files: number
+  max_analysis_characters: number
+  analysis_batch_files: number
+  analysis_batch_characters: number
+  max_graph_index_files?: number
+  max_graph_index_characters?: number
+  max_knowledge_index_files?: number
+  max_knowledge_index_characters?: number
 }
 
 export interface Uploads {
@@ -124,5 +155,9 @@ export const requirementsApi = {
   tasks: () => requirementsClient.get<{ tasks: AnalysisTask[] }>('/tasks', { params: { limit: 100 } }),
   cancel: (taskId: string) => requirementsClient.post(`/tasks/${taskId}/cancel`),
   documentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/document`,
+  businessDocumentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/business-document`,
+  download: async (taskId: string) => (
+    await requirementsClient.get<Blob>(`/tasks/${taskId}/document`, { responseType: 'blob' })
+  ).data,
   analysisUrl: (taskId: string) => `/api/v1/tasks/${taskId}/analysis`,
 }

@@ -1,4 +1,5 @@
-from typing import Annotated, Literal
+import re
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -33,6 +34,7 @@ class InputContext(StrictModel):
     branch: str | None
     selectedPath: str | None
     supportingInputs: SupportingInputs
+    analysisFocus: str = ""
 
 
 class Evidence(StrictModel):
@@ -61,6 +63,7 @@ class Artifact(StrictModel):
     sourceType: SourceType
     sourceName: str
     content: str = Field(min_length=1)
+    lineOffset: int = Field(default=0, ge=0)
     filePath: str | None = None
     externalId: str | None = None
     worksheet: str | None = None
@@ -92,17 +95,17 @@ class Diagram(StrictModel):
     generated: bool
     title: str
     description: str
-    plantUml: str
+    mermaid: str
     sourceEvidence: list[Evidence]
     reason: str
 
     @model_validator(mode="after")
     def valid_shape(self):
         if self.generated:
-            if not all([self.title, self.plantUml, self.sourceEvidence]):
-                raise ValueError("Generated diagrams require a title, UML, and evidence")
+            if not all([self.title, self.mermaid, self.sourceEvidence]):
+                raise ValueError("Generated diagrams require a title, Mermaid source, and evidence")
         elif (
-            self.title or self.description or self.plantUml or self.sourceEvidence
+            self.title or self.description or self.mermaid or self.sourceEvidence
             or self.reason != "Not evidenced in the supplied artifacts."
         ):
             raise ValueError("Invalid non-generated diagram")
@@ -147,6 +150,9 @@ class AnalysisScope(StrictModel):
     unsupportedFiles: list[str]
     unreadableFiles: list[str]
     limitations: list[str]
+    analyzedCodeFiles: int = Field(default=0, ge=0)
+    analyzedSupportingArtifacts: int = Field(default=0, ge=0)
+    analysisBatchCount: int = Field(default=0, ge=0)
 
 
 class CodeInventory(StrictModel):
@@ -189,6 +195,20 @@ class Traceability(StrictModel):
     validationStatus: EvidenceStatus
 
 
+def _derived_capability(requirement: str, requirement_id: str) -> str:
+    label = re.sub(
+        r"^(?:the\s+)?(?:system|application)\s+shall\s+",
+        "",
+        requirement.strip(),
+        flags=re.IGNORECASE,
+    )
+    label = re.split(r"(?<=[.!?])\s+|\s+(?:so that|to ensure)\s+", label, maxsplit=1)[0]
+    label = label.strip(" .;:")
+    if len(label) > 80:
+        label = label[:77].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
+    return label or requirement_id or "Functional requirement"
+
+
 class AnalysisResult(StrictModel):
     status: Literal["SUCCESS"]
     schemaVersion: Literal["2.0"]
@@ -209,6 +229,52 @@ class AnalysisResult(StrictModel):
     limitations: list[str]
     warnings: list[str]
     validationStatement: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_missing_capabilities(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        requirements = value.get("highLevelRequirements")
+        if not isinstance(requirements, list):
+            return value
+
+        normalized = dict(value)
+        normalized_requirements = []
+        repaired = False
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                normalized_requirements.append(requirement)
+                continue
+            capability = requirement.get("capability")
+            if isinstance(capability, str) and capability.strip():
+                normalized_requirements.append(requirement)
+                continue
+            statement = requirement.get("requirement")
+            if not isinstance(statement, str) or not statement.strip():
+                normalized_requirements.append(requirement)
+                continue
+            normalized_requirement = dict(requirement)
+            normalized_requirement["capability"] = _derived_capability(
+                statement, str(requirement.get("id", "")),
+            )
+            normalized_requirements.append(normalized_requirement)
+            repaired = True
+
+        if not repaired:
+            return value
+        normalized["highLevelRequirements"] = normalized_requirements
+        warning = (
+            "TIP derived one or more missing functional requirement capability labels "
+            "from their requirement statements."
+        )
+        warnings = normalized.get("warnings")
+        if isinstance(warnings, list):
+            if warning not in warnings:
+                normalized["warnings"] = [*warnings, warning]
+        elif "warnings" not in normalized:
+            normalized["warnings"] = [warning]
+        return normalized
 
 
 class ManualStory(StrictModel):
@@ -245,6 +311,6 @@ class AnalysisOptions(StrictModel):
             raise ValueError("local_path is required")
         if self.code_source == "indexed" and not self.indexed_repo_id:
             raise ValueError("indexed_repo_id is required")
-        if (self.focus or self.selected_path) and self.analysis_mode == "FULL":
-            raise ValueError("Selected paths or retrieval focus require INCREMENTAL or UNKNOWN scope")
+        if self.selected_path and self.analysis_mode == "FULL":
+            raise ValueError("Selected paths require INCREMENTAL or UNKNOWN scope")
         return self

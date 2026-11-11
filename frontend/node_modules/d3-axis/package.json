@@ -1,0 +1,57 @@
+{
+  "name": "d3-axis",
+  "version": "3.0.1",
+  "description": "Displays automatic reference lines for scales.",
+  "homepage": "https://d3js.org/d3-axis/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/d3/d3-axis.git"
+  },
+  "keywords": [
+    "d3",
+    "d3-module",
+    "axis",
+    "scale",
+    "visualization"
+  ],
+  "license": "ISC",
+  "author": {
+    "name": "Mike Bostock",
+    "url": "https://bost.ocks.org/mike"
+  },
+  "type": "module",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs"
+  ],
+  "module": "dist/d3-axis.mjs",
+  "main": "dist/d3-axis.mjs",
+  "jsdelivr": "dist/d3-axis.min.js",
+  "unpkg": "dist/d3-axis.min.js",
+  "exports": {
+    "umd": "./dist/d3-axis.min.js",
+    "default": "./dist/d3-axis.mjs"
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "d3-scale": "^4.0.3",
+    "d3-selection": "^3.0.1",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "js-beautify": "^1.15.4",
+    "jsdom": "^21.1.2",
+    "rollup": "^4.67.4",
+    "vitest": "^5.1.0"
+  },
+  "scripts": {
+    "test": "vitest",
+    "lint": "eslint",
+    "prepublishOnly": "rm -rf dist && rollup -c"
+  },
+  "engines": {
+    "node": ">=12"
+  }
+}

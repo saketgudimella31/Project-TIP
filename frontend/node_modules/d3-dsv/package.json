@@ -1,0 +1,71 @@
+{
+  "name": "d3-dsv",
+  "version": "3.0.2",
+  "description": "A parser and formatter for delimiter-separated values, such as CSV and TSV",
+  "homepage": "https://d3js.org/d3-dsv/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/d3/d3-dsv.git"
+  },
+  "keywords": [
+    "d3",
+    "d3-module",
+    "dsv",
+    "csv",
+    "tsv"
+  ],
+  "license": "ISC",
+  "author": {
+    "name": "Mike Bostock",
+    "url": "http://bost.ocks.org/mike"
+  },
+  "type": "module",
+  "files": [
+    "bin/*.js",
+    "dist/**/*.js",
+    "dist/**/*.mjs"
+  ],
+  "module": "dist/d3-dsv.mjs",
+  "main": "dist/d3-dsv.mjs",
+  "jsdelivr": "dist/d3-dsv.min.js",
+  "unpkg": "dist/d3-dsv.min.js",
+  "exports": {
+    "umd": "./dist/d3-dsv.min.js",
+    "default": "./dist/d3-dsv.mjs"
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "commander": "7",
+    "iconv-lite": "0.6",
+    "rw": "1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "csv-spectrum": "^1.0.0",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "rollup": "^4.67.4",
+    "vitest": "^5.1.0"
+  },
+  "scripts": {
+    "test": "TZ=America/Los_Angeles vitest",
+    "lint": "eslint",
+    "prepublishOnly": "rm -rf dist && rollup -c"
+  },
+  "engines": {
+    "node": ">=12"
+  },
+  "bin": {
+    "csv2json": "bin/dsv2json.js",
+    "csv2tsv": "bin/dsv2dsv.js",
+    "dsv2dsv": "bin/dsv2dsv.js",
+    "dsv2json": "bin/dsv2json.js",
+    "json2csv": "bin/json2dsv.js",
+    "json2dsv": "bin/json2dsv.js",
+    "json2tsv": "bin/json2dsv.js",
+    "tsv2csv": "bin/dsv2dsv.js",
+    "tsv2json": "bin/dsv2json.js"
+  }
+}

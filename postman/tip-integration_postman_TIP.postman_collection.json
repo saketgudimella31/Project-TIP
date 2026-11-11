@@ -1,17 +1,135 @@
 {
   "info": {
     "name": "TIP frontend/backend integration",
-    "description": "Local orchestration API. No gateway or Jira credentials belong in this collection.",
+    "description": "Local TIP + codebase_rag API. Graph storage defaults to Kuzu; TIP_GRAPH_BACKEND=sqlite selects the explicit fallback. No Neo4j server is needed. Repository ingestion is batched locally (default 500,000 files / 5 GB); requirements analysis processes every eligible file in bounded model batches and reports analyzed coverage. Analysis focus guides synthesis; it does not filter files. A 504 is retried with smaller batches, but an upstream gateway can still fail and no partial report is published. For frontend-equivalent requirements/UML analysis, call POST /analysis; the backend loads backend/tip/prompts/system.txt, applies its AnalysisResult schema, validates Mermaid, and creates the Word document. The direct gateway request is only a connectivity smoke test, not analysis. No credentials are committed in this collection.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "baseUrl", "value": "http://127.0.0.1:8000/api/v1" },
     { "key": "taskId", "value": "" },
-    { "key": "repoId", "value": "" }
+    { "key": "repoId", "value": "" },
+    { "key": "indexedFileCount", "value": "" },
+    { "key": "analyzedFileCount", "value": "" },
+    { "key": "analysisBatchCount", "value": "" },
+    { "key": "repoUrl", "value": "https://github.com/saketgudimella31/Project-TIP" },
+    { "key": "branch", "value": "main" },
+    { "key": "selectedPath", "value": "" },
+    { "key": "filePath", "value": "src/codebase_rag/config/settings.py" },
+    { "key": "focus", "value": "codebase_rag" },
+    { "key": "memoryId", "value": "" },
+    { "key": "gatewayBaseUrl", "value": "https://connect-wan.fiservapis.com/ai-gateway/v1" },
+    { "key": "model", "value": "azure-openai-5-2" },
+    { "key": "AppConsumerKey", "value": "" },
+    { "key": "AppConsumerSecret", "value": "" }
   ],
   "item": [
     {
+      "name": "Direct model connectivity (smoke test only; enter credentials locally)",
+      "description": "Checks gateway authentication and connectivity with a tiny JSON response. It does not run TIP analysis or create a Word document. Use POST {{baseUrl}}/analysis for the same analysis flow as the frontend; that endpoint uses the backend prompt and schema.",
+      "event": [{
+        "listen": "prerequest",
+        "script": { "type": "text/javascript", "exec": [
+          "const key = pm.collectionVariables.get('AppConsumerKey');",
+          "const secret = pm.collectionVariables.get('AppConsumerSecret');",
+          "if (!key || !secret) throw new Error('Set AppConsumerKey and AppConsumerSecret locally');",
+          "const CryptoJS = require('crypto-js');",
+          "const id = pm.variables.replaceIn('{{$guid}}');",
+          "const time = String(Date.now());",
+          "const body = pm.variables.replaceIn(pm.request.body.raw || '');",
+          "pm.request.body.update(body);",
+          "const signature = CryptoJS.enc.Base64.stringify(CryptoJS.HmacSHA256(key + id + time + body, secret));",
+          "pm.request.headers.upsert({key:'api-key',value:key});",
+          "pm.request.headers.upsert({key:'Client-Request-Id',value:id});",
+          "pm.request.headers.upsert({key:'Timestamp',value:time});",
+          "pm.request.headers.upsert({key:'Authorization',value:signature});"
+        ] }
+      }, {
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Gateway completion succeeds', function () {",
+          "  pm.response.to.have.status(200);",
+          "  pm.expect(pm.response.json().choices).to.be.an('array');",
+          "});"
+        ] }
+      }],
+      "request": {
+        "method": "POST", "url": "{{gatewayBaseUrl}}/chat/completions",
+        "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"model\":\"{{model}}\",\"messages\":[{\"role\":\"system\",\"content\":\"This is a gateway connectivity smoke test only, not a TIP analysis. Return one JSON object only; do not generate requirements, UML diagrams, or documents.\"},{\"role\":\"user\",\"content\":\"Return exactly {\\\"status\\\":\\\"ready\\\"}.\"}],\"max_tokens\":100,\"stream\":false,\"response_format\":{\"type\":\"json_object\"}}" }
+      }
+    },
+    {
+      "name": "Vector or hybrid chunk search",
+      "request": { "method": "GET", "url": "{{baseUrl}}/knowledge/search?scope={{repoId}}&query={{focus}}&mode=hybrid&top_k=10" }
+    },
+    {
+      "name": "Symbols, resolved calls and unresolved-call diagnostics",
+      "request": { "method": "GET", "url": "{{baseUrl}}/graph/symbols?repoId={{repoId}}" }
+    },
+    {
+      "name": "Ask model using cited retrieved sources",
+      "request": {
+        "method": "POST", "url": "{{baseUrl}}/knowledge/query",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"scope\":\"{{repoId}}\",\"question\":\"Explain {{focus}} from the indexed code\",\"mode\":\"hybrid\"}" }
+      }
+    },
+    {
+      "name": "Add project memory",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Memory saved', function () { pm.response.to.have.status(201); });",
+          "if (pm.response.code === 201) pm.collectionVariables.set('memoryId', pm.response.json().memory_id);"
+        ] }
+      }],
+      "request": {
+        "method": "POST", "url": "{{baseUrl}}/memory/add",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"project_id\":\"{{repoId}}\",\"memory_type\":\"decision\",\"title\":\"Local graph storage\",\"content\":\"Use an embedded graph for local code exploration\",\"tags\":[\"architecture\"],\"importance\":0.7}" }
+      }
+    },
+    {
+      "name": "Search project memories",
+      "request": { "method": "GET", "url": "{{baseUrl}}/memory/search?project_id={{repoId}}&limit=20" }
+    },
+    {
+      "name": "Read project memory",
+      "request": { "method": "GET", "url": "{{baseUrl}}/memory/{{memoryId}}" }
+    },
+    {
+      "name": "Project memory summary",
+      "request": { "method": "GET", "url": "{{baseUrl}}/memory/summary/{{repoId}}" }
+    },
+    {
+      "name": "Extract memories for review (requires gateway; does not auto-save)",
+      "request": {
+        "method": "POST", "url": "{{baseUrl}}/memory/extract",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"project_id\":\"{{repoId}}\",\"source\":\"conversation\",\"content\":\"We decided to use an embedded graph for local development.\",\"auto_save\":false}" }
+      }
+    },
+    {
+      "name": "Replacement graph schema",
+      "request": { "method": "GET", "url": "{{baseUrl}}/graph/schema" }
+    },
+    {
+      "name": "Knowledge storage statistics",
+      "request": { "method": "GET", "url": "{{baseUrl}}/knowledge/statistics" }
+    },
+    {
       "name": "Health",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Graph backend is ready without Neo4j', function () {",
+          "  pm.response.to.have.status(200);",
+          "  const health = pm.response.json();",
+          "  pm.expect(health.graph_backend).to.be.oneOf(['kuzu', 'sqlite']);",
+          "  pm.expect(health.services.graph_service).to.eql(true);",
+          "});"
+        ] }
+      }],
       "request": { "method": "GET", "url": "{{baseUrl}}/health" }
     },
     {
@@ -42,6 +160,7 @@
     },
     {
       "name": "Analyze uploaded code, Excel and Word (choose files first)",
+      "description": "Frontend-equivalent multipart analysis request. Select local files for code_files, requirements_files, and/or design_files. The backend supplies its own system prompt and Mermaid/AnalysisResult contract; poll the returned taskId, then download the Word document.",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [
@@ -72,6 +191,16 @@
           "if (pm.response.code === 200) {",
           "  const task = pm.response.json();",
           "  if (task.result && task.result.repo_id) pm.collectionVariables.set('repoId', task.result.repo_id);",
+          "  if (task.result && task.result.files_indexed !== undefined) pm.collectionVariables.set('indexedFileCount', task.result.files_indexed);",
+          "  if (task.result && task.result.repository_coverage) {",
+          "    const coverage = task.result.repository_coverage;",
+          "    pm.test('All indexed readable code is analyzed', function () {",
+          "      pm.expect(coverage.retrievedCodeFiles).to.eql(coverage.indexedCodeFiles);",
+          "      pm.expect(coverage.analysisBatchCount).to.be.above(0);",
+          "    });",
+          "    pm.collectionVariables.set('analyzedFileCount', coverage.retrievedCodeFiles);",
+          "    pm.collectionVariables.set('analysisBatchCount', coverage.analysisBatchCount);",
+          "  }",
           "}"
         ] }
       }],
@@ -86,6 +215,10 @@
       "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/document" }
     },
     {
+      "name": "Download plain-language business Word document (Send and Download)",
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/business-document" }
+    },
+    {
       "name": "Cancel current task",
       "request": { "method": "POST", "url": "{{baseUrl}}/tasks/{{taskId}}/cancel" }
     },
@@ -95,7 +228,83 @@
     },
     {
       "name": "Retrieve indexed source context",
-      "request": { "method": "GET", "url": "{{baseUrl}}/context/pack?repoId={{repoId}}&focus=order&budget=12000" }
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Context respects the character budget', function () {",
+          "  pm.response.to.have.status(200);",
+          "  const pack = pm.response.json();",
+          "  pm.expect(pack.items).to.be.an('array');",
+          "  pm.expect(pack.budget_used).to.be.at.most(pack.budget_limit);",
+          "});"
+        ] }
+      }],
+      "request": { "method": "GET", "url": "{{baseUrl}}/context/pack?repoId={{repoId}}&focus={{focus}}&budget=12000" }
+    },
+    {
+      "name": "Index repository without Neo4j (poll current task until success)",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Indexing accepted', function () { pm.response.to.have.status(202); });",
+          "if (pm.response.code === 202) {",
+          "  pm.collectionVariables.set('taskId', pm.response.json().task_id);",
+          "  pm.collectionVariables.set('repoId', pm.response.json().repo_id);",
+          "}"
+        ] }
+      }],
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/ingest/repo",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"repo_url\":\"{{repoUrl}}\",\"branch\":\"{{branch}}\",\"selected_path\":\"{{selectedPath}}\",\"mode\":\"full\"}"
+        }
+      }
+    },
+    {
+      "name": "Search indexed source files",
+      "request": { "method": "GET", "url": "{{baseUrl}}/graph/related?repoId={{repoId}}&query={{focus}}&limit=10" }
+    },
+    {
+      "name": "Dependency impact (static reverse imports and calls)",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Persistent graph impact response', function () {",
+          "  pm.response.to.have.status(200);",
+          "  const impact = pm.response.json();",
+          "  pm.expect(impact.backend).to.be.oneOf(['kuzu', 'sqlite']);",
+          "  pm.expect(impact.nodes).to.be.an('array');",
+          "  pm.expect(impact.relationships).to.be.an('array');",
+          "  pm.expect(impact.limitations).to.be.an('array');",
+          "});"
+        ] }
+      }],
+      "request": { "method": "GET", "url": "{{baseUrl}}/graph/impact?repoId={{repoId}}&file={{filePath}}&depth=2&limit=50" }
+    },
+    {
+      "name": "Analyze actual indexed source (requires AI gateway)",
+      "description": "Frontend-equivalent indexed analysis request. Sends AnalysisOptions to the local backend; the focus variable guides synthesis but does not select or exclude files. Every eligible indexed file is analyzed in bounded batches. Results include exact analyzed coverage and batch count; the backend validates each batch and generates the Word document only after all batches succeed.",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Indexed analysis accepted', function () { pm.response.to.have.status(202); });",
+          "if (pm.response.code === 202) pm.collectionVariables.set('taskId', pm.response.json().task_id);"
+        ] }
+      }],
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/analysis",
+        "body": {
+          "mode": "formdata",
+          "formdata": [{
+            "key": "options", "type": "text",
+            "value": "{\"target_application\":\"Project TIP\",\"analysis_mode\":\"INCREMENTAL\",\"code_source\":\"indexed\",\"indexed_repo_id\":\"{{repoId}}\",\"focus\":\"{{focus}}\",\"selected_path\":\"{{selectedPath}}\"}"
+          }]
+        }
+      }
     }
   ]
 }

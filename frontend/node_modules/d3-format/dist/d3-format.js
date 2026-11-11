@@ -1,4 +1,4 @@
-// https://d3js.org/d3-format/ v3.1.2 Copyright 2010-2026 Mike Bostock
+// https://d3js.org/d3-format/ v3.1.3 Copyright 2010-2026 Mike Bostock
 (function (global, factory) {
 typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
 typeof define === 'function' && define.amd ? define(['exports'], factory) :

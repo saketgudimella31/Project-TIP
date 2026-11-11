@@ -1,0 +1,64 @@
+{
+  "name": "d3-delaunay",
+  "version": "6.0.6",
+  "description": "Compute the Voronoi diagram of a set of two-dimensional points.",
+  "homepage": "https://github.com/d3/d3-delaunay",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/d3/d3-delaunay.git"
+  },
+  "keywords": [
+    "voronoi",
+    "delaunay",
+    "geometry"
+  ],
+  "license": "ISC",
+  "author": {
+    "name": "Mike Bostock",
+    "url": "https://bost.ocks.org/mike"
+  },
+  "contributors": [
+    {
+      "name": "Vladimir Agafonkin",
+      "url": "https://agafonkin.com"
+    },
+    {
+      "name": "Philippe Rivière",
+      "url": "https://visionscarto.net"
+    }
+  ],
+  "type": "module",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs"
+  ],
+  "module": "dist/d3-delaunay.mjs",
+  "main": "dist/d3-delaunay.mjs",
+  "jsdelivr": "dist/d3-delaunay.min.js",
+  "unpkg": "dist/d3-delaunay.min.js",
+  "exports": {
+    "umd": "./dist/d3-delaunay.min.js",
+    "default": "./dist/d3-delaunay.mjs"
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "delaunator": "5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "rollup": "^4.67.4",
+    "vitest": "^5.1.0"
+  },
+  "scripts": {
+    "test": "vitest",
+    "lint": "eslint",
+    "prepublishOnly": "rm -rf dist && rollup -c"
+  },
+  "engines": {
+    "node": ">=12"
+  }
+}

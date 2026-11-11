@@ -1,29 +1,136 @@
 import re
 
-from .models import AnalysisResult, Artifact, Evidence, InputContext
+from .models import AnalysisResult, Artifact, Diagram, Evidence, InputContext
+
+INVALID_DIAGRAM_WARNING = (
+    "One or more generated UML diagrams were omitted because their Mermaid source "
+    "was invalid or unsupported."
+)
+CHUNK_RELATIVE_CITATION_WARNING = (
+    "One or more chunk-relative line citations were converted to original file line numbers."
+)
+OMITTED_LINE_CITATION_WARNING = (
+    "One or more line citations fell outside the supplied artifact chunk; line numbers were "
+    "omitted while retaining the source-file references."
+)
 
 
-def validate_plantuml(text: str):
+def validate_mermaid(text: str):
     stripped = text.strip()
     if (
-        not stripped.startswith("@startuml")
-        or not stripped.endswith("@enduml")
-        or stripped.count("@startuml") != 1
-        or stripped.count("@enduml") != 1
+        not re.match(
+            r"(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram-v2|erDiagram)\b",
+            stripped,
+            re.IGNORECASE,
+        )
         or len(stripped) > 50_000
+        or len(stripped.splitlines()) > 1_000
     ):
-        raise ValueError("PlantUML must contain one bounded, self-contained diagram")
+        raise ValueError("Mermaid must contain one bounded, supported diagram")
     if re.search(
-        r"(?im)^\s*!|https?://|file:|<img|\[\[|%\w+\s*\(|"
-        r"(?im:^\s*(?:url|image|sprite|theme)\b)", text
+        r"^\s*%%\s*\{|^\s*click\s+\S|"
+        r"https?://|file:|data:|javascript:|url\s*\(|"
+        r"\bhref\s*[:=]|<\s*(?:script|iframe|img|foreignObject|svg|style)\b",
+        text,
+        re.IGNORECASE | re.MULTILINE,
     ):
-        raise ValueError("External resources and executable PlantUML directives are not allowed")
-    if not re.search(r"(?im)^\s*title\s+\S", text):
-        raise ValueError("Generated PlantUML must include a descriptive title")
+        raise ValueError("External resources, directives, and executable Mermaid content are not allowed")
+
+
+def _synchronize_traceability(result: AnalysisResult) -> None:
+    requirements = {
+        requirement.id: requirement
+        for requirement in [
+            *result.highLevelRequirements, *result.nonFunctionalRequirements,
+        ]
+    }
+    repaired = False
+    for trace in result.requirementsToDesignTraceability:
+        requirement = requirements.get(trace.requirementId)
+        if requirement is None:
+            continue
+        if (
+            trace.requirementSummary != requirement.requirement
+            or trace.requirementOrigin != requirement.requirementOrigin
+            or trace.sourceEvidence != requirement.sourceEvidence
+            or trace.implementationEvidenceStatus != requirement.implementationEvidenceStatus
+            or trace.validationStatus != requirement.evidenceStatus
+        ):
+            repaired = True
+        trace.requirementSummary = requirement.requirement
+        trace.requirementOrigin = list(requirement.requirementOrigin)
+        trace.sourceEvidence = list(requirement.sourceEvidence)
+        trace.implementationEvidenceStatus = requirement.implementationEvidenceStatus
+        trace.validationStatus = requirement.evidenceStatus
+    if repaired:
+        warning = (
+            "Repeated traceability details were synchronized from their linked requirements "
+            "because the model output disagreed."
+        )
+        if warning not in result.warnings:
+            result.warnings.append(warning)
+
+
+def _sanitize_invalid_diagrams(result: AnalysisResult) -> None:
+    diagrams = result.umlDiagrams
+    valid_references: dict[str, str] = {}
+    invalid_references = set()
+    invalid_count = 0
+
+    for name in type(diagrams).model_fields:
+        value = getattr(diagrams, name)
+        if isinstance(value, list):
+            retained = []
+            for index, diagram in enumerate(value):
+                reference = f"{name}[{index}]"
+                if diagram.generated:
+                    try:
+                        validate_mermaid(diagram.mermaid)
+                    except ValueError:
+                        invalid_count += 1
+                        invalid_references.update((reference, diagram.title))
+                        continue
+                    valid_references[reference] = f"{name}[{len(retained)}]"
+                    valid_references[diagram.title] = diagram.title
+                retained.append(diagram)
+            setattr(diagrams, name, retained)
+            continue
+
+        if not value.generated:
+            continue
+        try:
+            validate_mermaid(value.mermaid)
+        except ValueError:
+            invalid_count += 1
+            invalid_references.update((name, value.title))
+            setattr(diagrams, name, Diagram(
+                generated=False,
+                title="",
+                description="",
+                mermaid="",
+                sourceEvidence=[],
+                reason="Not evidenced in the supplied artifacts.",
+            ))
+        else:
+            valid_references[name] = name
+            valid_references[value.title] = value.title
+
+    if not invalid_count:
+        return
+    for trace in result.requirementsToDesignTraceability:
+        trace.relevantGeneratedDiagrams = [
+            valid_references.get(reference, reference)
+            for reference in trace.relevantGeneratedDiagrams
+            if reference not in invalid_references or reference in valid_references
+        ]
+    if INVALID_DIAGRAM_WARNING not in result.warnings:
+        result.warnings.append(INVALID_DIAGRAM_WARNING)
 
 
 def validate_result(result: AnalysisResult, artifacts: list[Artifact],
                     context: InputContext, target: str):
+    _synchronize_traceability(result)
+    _sanitize_invalid_diagrams(result)
     if result.inputContext != context or result.analysisScope.analysisMode != context.analysisMode:
         raise ValueError("Model changed the supplied analysis scope or input context")
     if result.documentInformation.targetApplication != target:
@@ -41,11 +148,32 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
         ]
         if not candidates:
             raise ValueError(f"Model cited an unknown evidence source: {evidence.sourceName}")
-        if evidence.lineStart is not None and not any(
-            len(a.content.splitlines()) >= (evidence.lineEnd or evidence.lineStart)
-            for a in candidates
-        ):
-            raise ValueError("Model cited a line outside the supplied artifact")
+        if evidence.lineStart is not None:
+            line_end = evidence.lineEnd or evidence.lineStart
+
+            def contains_original_lines(artifact: Artifact) -> bool:
+                first_line = artifact.lineOffset + 1
+                last_line = artifact.lineOffset + len(artifact.content.splitlines())
+                return first_line <= evidence.lineStart and line_end <= last_line
+
+            if not any(contains_original_lines(artifact) for artifact in candidates):
+                relative_offsets = {
+                    artifact.lineOffset for artifact in candidates
+                    if artifact.lineOffset > 0
+                    and line_end <= len(artifact.content.splitlines())
+                }
+                if len(relative_offsets) == 1:
+                    offset = relative_offsets.pop()
+                    evidence.lineStart += offset
+                    if evidence.lineEnd is not None:
+                        evidence.lineEnd += offset
+                    if CHUNK_RELATIVE_CITATION_WARNING not in result.warnings:
+                        result.warnings.append(CHUNK_RELATIVE_CITATION_WARNING)
+                else:
+                    evidence.lineStart = None
+                    evidence.lineEnd = None
+                    if OMITTED_LINE_CITATION_WARNING not in result.warnings:
+                        result.warnings.append(OMITTED_LINE_CITATION_WARNING)
         if evidence.section and not any(evidence.section in a.content for a in candidates):
             raise ValueError("Model cited a section not present in the supplied artifact")
         # Symbols and evidence descriptions still require human review; matching a file
@@ -72,7 +200,7 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
     generated_names = set()
     for name, diagram in result.umlDiagrams.entries():
         if diagram.generated:
-            validate_plantuml(diagram.plantUml)
+            validate_mermaid(diagram.mermaid)
             generated_names.update((name, diagram.title))
             for evidence in diagram.sourceEvidence:
                 check(evidence)
@@ -110,6 +238,69 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
     }
     if actual_support != supplied_support:
         raise ValueError("Supporting inventory does not match the supplied artifacts")
+
+
+def validate_merged_result(
+    result: AnalysisResult, context: InputContext, target: str, *,
+    expected_code_files: int, expected_supporting_artifacts: int,
+):
+    _synchronize_traceability(result)
+    _sanitize_invalid_diagrams(result)
+    if result.inputContext != context or result.analysisScope.analysisMode != context.analysisMode:
+        raise ValueError("Merged output changed the supplied analysis scope or input context")
+    if result.documentInformation.targetApplication != target:
+        raise ValueError("Merged output changed the target application")
+    if (
+        result.analysisScope.analyzedCodeFiles != expected_code_files
+        or result.analysisScope.analyzedSupportingArtifacts != expected_supporting_artifacts
+    ):
+        raise ValueError("Merged output coverage does not match the analyzed input")
+
+    requirements = [*result.highLevelRequirements, *result.nonFunctionalRequirements]
+    for prefix, group in (
+        ("HLR", result.highLevelRequirements), ("NFR", result.nonFunctionalRequirements)
+    ):
+        if [item.id for item in group] != [
+            f"{prefix}-{index:03d}" for index in range(1, len(group) + 1)
+        ]:
+            raise ValueError("Merged requirement IDs are not sequential")
+    generated_names = set()
+    for name, diagram in result.umlDiagrams.entries():
+        if diagram.generated:
+            validate_mermaid(diagram.mermaid)
+            generated_names.update((name, diagram.title))
+    by_id = {item.id: item for item in requirements}
+    trace_ids = [item.requirementId for item in result.requirementsToDesignTraceability]
+    if len(trace_ids) != len(set(trace_ids)) or set(trace_ids) != set(by_id):
+        raise ValueError("Merged traceability must map every requirement exactly once")
+    for requirement in requirements:
+        origins = {item.sourceType for item in requirement.sourceEvidence}
+        if set(requirement.requirementOrigin) != origins:
+            raise ValueError("Merged requirement origin does not match its cited evidence")
+        if requirement.implementationEvidenceStatus in {
+            "IMPLEMENTATION_EVIDENCED", "IMPLEMENTATION_PARTIALLY_EVIDENCED",
+        } and "CODE" not in origins:
+            raise ValueError("Merged requirement claims implementation without cited code")
+    for trace in result.requirementsToDesignTraceability:
+        requirement = by_id[trace.requirementId]
+        if (
+            trace.sourceEvidence != requirement.sourceEvidence
+            or trace.implementationEvidenceStatus != requirement.implementationEvidenceStatus
+            or set(trace.requirementOrigin) != set(requirement.requirementOrigin)
+            or trace.validationStatus != requirement.evidenceStatus
+        ):
+            raise ValueError("Merged traceability disagrees with its requirement")
+        if not set(trace.relevantGeneratedDiagrams).issubset(generated_names):
+            raise ValueError("Merged traceability references an omitted or unknown diagram")
+    inventory_paths = [item.relativePath for item in result.codebaseInventory]
+    if (
+        len(inventory_paths) != len(set(inventory_paths))
+        or len(inventory_paths) > expected_code_files
+        or result.analysisScope.includedFiles != inventory_paths
+    ):
+        raise ValueError("Merged code inventory is inconsistent with analyzed coverage")
+    if len(result.supportingArtifactInventory) > expected_supporting_artifacts:
+        raise ValueError("Merged supporting inventory exceeds analyzed coverage")
 
 
 def add_backend_warnings(result: AnalysisResult, context: InputContext,

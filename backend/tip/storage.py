@@ -4,11 +4,17 @@ import re
 import sqlite3
 import threading
 import uuid
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterable, Iterator
 
 from .models import Artifact
+from codebase_rag.services.graph.code_graph import CodeGraph
+from codebase_rag.services.knowledge.local_store import LocalKnowledge
+
+logger = logging.getLogger(__name__)
 
 
 def now() -> str:
@@ -16,14 +22,26 @@ def now() -> str:
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, graph: CodeGraph | None = None,
+                 knowledge: LocalKnowledge | None = None, *,
+                 max_graph_files: int = 5_000,
+                 max_graph_characters: int = 25_000_000,
+                 max_knowledge_files: int = 500,
+                 max_knowledge_characters: int = 5_000_000):
         self.path = path
+        self.graph = graph
+        self.knowledge = knowledge
+        self.max_graph_files = max_graph_files
+        self.max_graph_characters = max_graph_characters
+        self.max_knowledge_files = max_knowledge_files
+        self.max_knowledge_characters = max_knowledge_characters
         path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         with self.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY, body TEXT NOT NULL, document BLOB
+                    id TEXT PRIMARY KEY, body TEXT NOT NULL, document BLOB,
+                    business_document BLOB
                 );
                 CREATE TABLE IF NOT EXISTS artifacts (
                     id INTEGER PRIMARY KEY, repo_id TEXT NOT NULL,
@@ -76,6 +94,9 @@ class Store:
                     content, path, repo_id UNINDEXED, artifact_id UNINDEXED
                 );
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+            if "business_document" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN business_document BLOB")
 
     @contextmanager
     def connect(self):
@@ -119,7 +140,10 @@ class Store:
                 db.execute("UPDATE tasks SET body=? WHERE id=?", (json.dumps(task), task_id))
             return task
 
-    def complete(self, task_id: str, result: dict, document: bytes | None):
+    def complete(
+        self, task_id: str, result: dict, document: bytes | None,
+        business_document: bytes | None = None,
+    ):
         with self.lock:
             task = self.get(task_id)
             if task is None:
@@ -130,8 +154,10 @@ class Store:
                 analysis = result.get("analysis")
                 if isinstance(analysis, dict):
                     self._persist_analysis(db, task_id, analysis)
-                db.execute("UPDATE tasks SET body=?, document=? WHERE id=?",
-                           (json.dumps(task), document, task_id))
+                db.execute(
+                    "UPDATE tasks SET body=?, document=?, business_document=? WHERE id=?",
+                    (json.dumps(task), document, business_document, task_id),
+                )
 
     @staticmethod
     def _persist_analysis(db, task_id: str, analysis: dict):
@@ -223,6 +249,13 @@ class Store:
             row = db.execute("SELECT document FROM tasks WHERE id=?", (task_id,)).fetchone()
         return row["document"] if row else None
 
+    def business_document(self, task_id: str) -> bytes | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT business_document FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        return row["business_document"] if row else None
+
     def list_tasks(self, status: str | None = None, limit: int = 100) -> dict:
         with self.connect() as db:
             clauses = "WHERE json_extract(body, '$.status')=?" if status else ""
@@ -234,9 +267,14 @@ class Store:
             ).fetchall()
         return {"tasks": [json.loads(row["body"]) for row in rows], "total_count": total}
 
-    def index(self, repo_id: str, artifacts: list[Artifact], replace: bool = True):
+    def index(
+        self, repo_id: str, artifacts: list[Artifact], replace: bool = True, *,
+        include_knowledge: bool = True, include_graph: bool = True,
+    ):
         if not artifacts:
             raise ValueError("No readable code artifacts to index")
+        warnings = []
+        graph_result = {"backend": None, "warnings": []}
         with self.lock, self.connect() as db:
             if replace:
                 db.execute("DELETE FROM source_fts WHERE repo_id=?", (repo_id,))
@@ -257,9 +295,318 @@ class Store:
                     "INSERT INTO source_fts(content,path,repo_id,artifact_id) VALUES (?,?,?,?)",
                     (artifact.content, ref, repo_id, row.lastrowid),
                 )
+            file_count, character_count = db.execute(
+                "SELECT count(*), coalesce(sum(length(json_extract(artifact, '$.content'))), 0) "
+                "FROM artifacts WHERE repo_id=?", (repo_id,),
+            ).fetchone()
+            if include_knowledge and self.knowledge:
+                if (
+                    file_count <= self.max_knowledge_files
+                    and character_count <= self.max_knowledge_characters
+                ):
+                    documents = []
+                    for row in db.execute(
+                        "SELECT ref, artifact FROM artifacts WHERE repo_id=?", (repo_id,),
+                    ):
+                        artifact = json.loads(row["artifact"])
+                        content = artifact.pop("content")
+                        documents.append({
+                            "ref": row["ref"], "content": content, "metadata": artifact,
+                        })
+                    self.knowledge.index(db, repo_id, documents)
+                else:
+                    db.execute("DELETE FROM rag_fts WHERE scope=?", (repo_id,))
+                    db.execute("DELETE FROM rag_chunks WHERE scope=?", (repo_id,))
+                    db.execute("DELETE FROM rag_snapshots WHERE scope=?", (repo_id,))
+                    warnings.append(
+                        "Semantic chunk/vector indexing was skipped above the configured limit; "
+                        "SQLite full-text retrieval remains available."
+                    )
+            if include_graph and self.graph:
+                # The graph is derived. Impact reads reconcile it with the authoritative
+                # SQLite snapshot, including after an interrupted cross-database commit.
+                graph_sources = (
+                    self._sources(db, repo_id)
+                    if (
+                        file_count <= self.max_graph_files
+                        and character_count <= self.max_graph_characters
+                    )
+                    else {}
+                )
+                if not graph_sources and file_count:
+                    warnings.append(
+                        "Code graph indexing was skipped above the configured limit; "
+                        "SQLite full-text retrieval remains available."
+                    )
+                try:
+                    graph_result = self.graph.index(repo_id, graph_sources)
+                except (RuntimeError, sqlite3.Error) as error:
+                    logger.exception("Code graph indexing failed")
+                    raise ValueError(
+                        "Code graph indexing failed; no source snapshot was committed. "
+                        "Check the graph data directory and backend configuration."
+                    ) from error
+        return {
+            "backend": graph_result.get("backend"),
+            "warnings": list(dict.fromkeys([*warnings, *graph_result.get("warnings", [])])),
+        }
 
-    def retrieve(self, repo_id: str, query: str = "", limit: int = 500) -> list[Artifact]:
+    def index_batches(
+        self, repo_id: str, artifacts: Iterable[Artifact], *,
+        batch_size: int = 100, check: Callable[[], None] | None = None,
+        progress: Callable[[int], None] | None = None,
+    ) -> dict:
+        if batch_size < 1:
+            raise ValueError("Index batch size must be positive")
+        staging_id = f"{repo_id}:staging:{uuid.uuid4().hex}"
+        batch: list[Artifact] = []
+        indexed_files = 0
+        indexed_characters = 0
+        warnings = []
+
+        def flush():
+            nonlocal batch, indexed_files, indexed_characters
+            if not batch:
+                return
+            self.index(
+                staging_id, batch, replace=indexed_files == 0,
+                include_knowledge=False, include_graph=False,
+            )
+            indexed_files += len(batch)
+            indexed_characters += sum(len(item.content) for item in batch)
+            batch = []
+            if progress:
+                progress(indexed_files)
+
+        try:
+            for artifact in artifacts:
+                if check:
+                    check()
+                batch.append(artifact)
+                if len(batch) >= batch_size:
+                    flush()
+            flush()
+            if not indexed_files:
+                return {
+                    "files_indexed": 0, "characters_indexed": 0,
+                    "graph_backend": None, "warnings": [],
+                }
+
+            graph_sources = None
+            with self.lock, self.connect() as db:
+                if check:
+                    check()
+                db.execute("DELETE FROM source_fts WHERE repo_id=?", (repo_id,))
+                db.execute("DELETE FROM artifacts WHERE repo_id=?", (repo_id,))
+                db.execute(
+                    "UPDATE artifacts SET repo_id=? WHERE repo_id=?", (repo_id, staging_id),
+                )
+                db.execute(
+                    "UPDATE source_fts SET repo_id=? WHERE repo_id=?", (repo_id, staging_id),
+                )
+                if self.knowledge:
+                    db.execute("DELETE FROM rag_fts WHERE scope=?", (repo_id,))
+                    db.execute("DELETE FROM rag_chunks WHERE scope=?", (repo_id,))
+                    db.execute("DELETE FROM rag_snapshots WHERE scope=?", (repo_id,))
+                    if (
+                        indexed_files <= self.max_knowledge_files
+                        and indexed_characters <= self.max_knowledge_characters
+                    ):
+                        documents = []
+                        for row in db.execute(
+                            "SELECT ref, artifact FROM artifacts WHERE repo_id=?", (repo_id,),
+                        ):
+                            artifact = json.loads(row["artifact"])
+                            content = artifact.pop("content")
+                            documents.append({
+                                "ref": row["ref"], "content": content, "metadata": artifact,
+                            })
+                        self.knowledge.index(db, repo_id, documents)
+                    else:
+                        warnings.append(
+                            "Semantic chunk/vector indexing was skipped for this large repository; "
+                            "SQLite full-text retrieval remains available."
+                        )
+                if self.graph:
+                    if (
+                        indexed_files <= self.max_graph_files
+                        and indexed_characters <= self.max_graph_characters
+                    ):
+                        graph_sources = self._sources(db, repo_id)
+                    else:
+                        graph_sources = {}
+                        warnings.append(
+                            "Code graph indexing was skipped because the repository exceeds the "
+                            f"{self.max_graph_files}-file or {self.max_graph_characters:,}-character "
+                            "graph limit; SQLite full-text retrieval remains available."
+                        )
+
+            graph_result = {"backend": None, "warnings": []}
+            if self.graph:
+                try:
+                    graph_result = self.graph.index(repo_id, graph_sources or {})
+                    warnings.extend(graph_result.get("warnings", []))
+                except (RuntimeError, sqlite3.Error):
+                    logger.exception("Code graph indexing failed for repository snapshot")
+                    warnings.append(
+                        "Code graph indexing failed; indexed source remains available for retrieval."
+                    )
+            return {
+                "files_indexed": indexed_files,
+                "characters_indexed": indexed_characters,
+                "graph_backend": graph_result.get("backend"),
+                "warnings": list(dict.fromkeys(warnings)),
+            }
+        except Exception:
+            with self.lock, self.connect() as db:
+                db.execute("DELETE FROM source_fts WHERE repo_id=?", (staging_id,))
+                db.execute("DELETE FROM artifacts WHERE repo_id=?", (staging_id,))
+            raise
+
+    def index_stats(self, repo_id: str, path_prefix: str | None = None) -> tuple[int, int]:
+        where = "repo_id=?"
+        params: tuple = (repo_id,)
+        if path_prefix:
+            where += " AND substr(ref, 1, ?)=?"
+            params = (repo_id, len(path_prefix), path_prefix)
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT count(*), coalesce(sum(length(json_extract(artifact, '$.content'))), 0) "
+                f"FROM artifacts WHERE {where}", params,
+            ).fetchone()
+        return int(row[0]), int(row[1])
+
+    def iter_artifacts(
+        self, repo_id: str, path_prefix: str | None = None, *,
+        batch_size: int = 100,
+    ) -> Iterator[Artifact]:
+        if batch_size < 1:
+            raise ValueError("Artifact iteration batch size must be positive")
+        last_ref = None
+        while True:
+            where = "repo_id=?"
+            params: tuple = (repo_id,)
+            if path_prefix:
+                where += " AND substr(ref, 1, ?)=?"
+                params = (repo_id, len(path_prefix), path_prefix)
+            if last_ref is not None:
+                where += " AND ref>?"
+                params = (*params, last_ref)
+            with self.connect() as db:
+                rows = db.execute(
+                    f"SELECT ref, artifact FROM artifacts WHERE {where} ORDER BY ref LIMIT ?",
+                    (*params, batch_size),
+                ).fetchall()
+            if not rows:
+                return
+            last_ref = rows[-1]["ref"]
+            for row in rows:
+                yield Artifact.model_validate_json(row["artifact"])
+
+    @staticmethod
+    def _sources(db, repo_id: str) -> dict[str, str]:
+        rows = db.execute(
+            "SELECT ref, artifact FROM artifacts WHERE repo_id=?", (repo_id,),
+        ).fetchall()
+        return {row["ref"]: json.loads(row["artifact"])["content"] for row in rows}
+
+    def impact(self, repo_id: str, file: str, depth: int, limit: int) -> dict:
+        if self.graph is None:
+            raise RuntimeError("Code graph is not configured")
+        file_count, character_count = self.index_stats(repo_id)
+        if (
+            file_count > self.max_graph_files
+            or character_count > self.max_graph_characters
+        ):
+            raise RuntimeError(
+                "Code graph queries are disabled above the configured file or character limit"
+            )
+        with self.lock, self.connect() as db:
+            return self.graph.impact(repo_id, file, self._sources(db, repo_id), depth, limit)
+
+    def symbols(self, repo_id: str) -> dict:
+        if self.graph is None:
+            raise RuntimeError("Code graph is not configured")
+        file_count, character_count = self.index_stats(repo_id)
+        if (
+            file_count > self.max_graph_files
+            or character_count > self.max_graph_characters
+        ):
+            raise RuntimeError(
+                "Code graph queries are disabled above the configured file or character limit"
+            )
+        with self.lock, self.connect() as db:
+            return self.graph.symbols(repo_id, self._sources(db, repo_id))
+
+    def rag_retrieve(self, repo_id: str, query: str = "", mode: str = "hybrid",
+                     limit: int = 500, path_prefix: str | None = None) -> list[Artifact]:
+        if path_prefix:
+            return self.retrieve(repo_id, query, limit, path_prefix)
+        if self.knowledge is None or not query:
+            return self.retrieve(repo_id, query, limit)
+        index_files, index_characters = self.index_stats(repo_id)
+        fallback_lexical = False
+        with self.lock, self.connect() as db:
+            snapshot = db.execute(
+                "SELECT signature FROM rag_snapshots WHERE scope=?", (repo_id,),
+            ).fetchone()
+            too_large_for_knowledge = (
+                index_files > self.max_knowledge_files
+                or index_characters > self.max_knowledge_characters
+            )
+            signature_changed = (
+                snapshot is not None
+                and snapshot["signature"] != self.knowledge.embeddings.signature
+            )
+            if too_large_for_knowledge:
+                if signature_changed:
+                    raise ValueError(
+                        "Embedding configuration changed; this large repository requires "
+                        "re-indexing before semantic retrieval"
+                    )
+                fallback_lexical = True
+            elif snapshot is None or signature_changed:
+                rows = db.execute(
+                    "SELECT ref, artifact FROM artifacts WHERE repo_id=?", (repo_id,),
+                ).fetchall()
+                documents = []
+                for row in rows:
+                    artifact = json.loads(row["artifact"])
+                    documents.append({
+                        "ref": row["ref"], "content": artifact.pop("content"),
+                        "metadata": artifact,
+                    })
+                self.knowledge.index(db, repo_id, documents)
+        if fallback_lexical:
+            return self.retrieve(repo_id, query, limit)
+        result = self.knowledge.search(repo_id, query, mode, min(limit, 100))
+        paths = list(dict.fromkeys(node["ref"] for node in result["nodes"]))
+        by_path = {
+            artifact.filePath: artifact
+            for artifact in self.retrieve_refs(repo_id, paths)
+        }
+        return [by_path[path] for path in paths[:limit] if path in by_path]
+
+    def retrieve_refs(self, repo_id: str, refs: list[str]) -> list[Artifact]:
+        if not refs:
+            return []
+        placeholders = ",".join("?" for _ in refs)
+        with self.connect() as db:
+            rows = db.execute(
+                f"SELECT artifact FROM artifacts WHERE repo_id=? AND ref IN ({placeholders})",
+                (repo_id, *refs),
+            ).fetchall()
+        artifacts = [Artifact.model_validate_json(row["artifact"]) for row in rows]
+        by_path = {artifact.filePath: artifact for artifact in artifacts}
+        return [by_path[path] for path in refs if path in by_path]
+
+    def retrieve(
+        self, repo_id: str, query: str = "", limit: int = 500,
+        path_prefix: str | None = None,
+    ) -> list[Artifact]:
         tokens = re.findall(r"\w+", query, re.UNICODE)[:40]
+        prefix_clause = " AND substr(a.ref, 1, ?)=?" if path_prefix else ""
+        prefix_params = (len(path_prefix), path_prefix) if path_prefix else ()
         with self.connect() as db:
             if tokens:
                 match = " OR ".join(f'"{token}"' for token in tokens)
@@ -267,13 +614,21 @@ class Store:
                     SELECT a.artifact FROM source_fts f
                     JOIN artifacts a ON a.id=f.artifact_id
                     WHERE source_fts MATCH ? AND f.repo_id=?
-                    ORDER BY bm25(source_fts) LIMIT ?
-                """, (match, repo_id, limit)).fetchall()
-            else:
-                rows = db.execute(
-                    "SELECT artifact FROM artifacts WHERE repo_id=? ORDER BY ref LIMIT ?",
-                    (repo_id, limit),
+                """ + prefix_clause + " ORDER BY bm25(source_fts) LIMIT ?",
+                    (match, repo_id, *prefix_params, limit),
                 ).fetchall()
+            else:
+                if path_prefix:
+                    rows = db.execute(
+                        "SELECT artifact FROM artifacts WHERE repo_id=? "
+                        "AND substr(ref, 1, ?)=? ORDER BY ref LIMIT ?",
+                        (repo_id, len(path_prefix), path_prefix, limit),
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT artifact FROM artifacts WHERE repo_id=? ORDER BY ref LIMIT ?",
+                        (repo_id, limit),
+                    ).fetchall()
         return [Artifact.model_validate_json(row["artifact"]) for row in rows]
 
     def metrics(self) -> str:

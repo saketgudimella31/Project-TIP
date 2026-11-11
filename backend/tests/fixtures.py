@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 from tip.models import AnalysisResult
 
 
-def sample_result(target, context, artifacts, with_diagram=False):
+def sample_result(target, context, artifacts, with_diagram=False, coverage=None):
     evidence = [{
         "sourceType": a.sourceType, "sourceName": a.sourceName, "filePath": a.filePath,
         "symbol": None, "externalId": a.externalId, "section": None,
@@ -16,7 +16,7 @@ def sample_result(target, context, artifacts, with_diagram=False):
         "IMPLEMENTATION_EVIDENCED" if "CODE" in origins else "IMPLEMENTATION_NOT_EVIDENCED"
     )
     omitted = {
-        "generated": False, "title": "", "description": "", "plantUml": "",
+        "generated": False, "title": "", "description": "", "mermaid": "",
         "sourceEvidence": [], "reason": "Not evidenced in the supplied artifacts.",
     }
     component = omitted
@@ -24,7 +24,7 @@ def sample_result(target, context, artifacts, with_diagram=False):
         component = {
             "generated": True, "title": "Synthetic order-status component",
             "description": "A test-only component illustration.",
-            "plantUml": "@startuml\ntitle Synthetic order-status component\ncomponent Orders\n@enduml",
+            "mermaid": "flowchart LR\n  Orders[Orders component] --> Status[Order status]",
             "sourceEvidence": evidence, "reason": "",
         }
     requirement = {

@@ -3,6 +3,7 @@ import { createFileRoute, Navigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Code2, FileArchive, FileText, Files, FolderOpen, Plus, Sheet, Trash2 } from 'lucide-react'
 import { FileUpload } from '../components/file-upload'
+import { DocumentDownload } from '../components/document-download'
 import { Button } from '../components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Input } from '../components/ui/input'
@@ -88,6 +89,8 @@ export function RequirementsPanel({
   const [jiraKeys, setJiraKeys] = useState('')
   const [stories, setStories] = useState<ManualStory[]>([])
   const [validationError, setValidationError] = useState('')
+  const [automaticDownload, setAutomaticDownload] = useState(true)
+  const [downloadTaskId, setDownloadTaskId] = useState<string>()
   const config = useQuery({
     queryKey: ['requirements-configuration'],
     queryFn: async () => (await requirementsApi.configuration()).data,
@@ -110,6 +113,7 @@ export function RequirementsPanel({
     mutationFn: (payload: { options: AnalysisOptions; uploads: Uploads }) =>
       requirementsApi.submit(payload.options, payload.uploads),
     onSuccess: async ({ data }) => {
+      setDownloadTaskId(automaticDownload ? data.task_id : undefined)
       onTaskChange(data.task_id)
       await queryClient.invalidateQueries({ queryKey: ['requirements-history'] })
     },
@@ -147,8 +151,8 @@ export function RequirementsPanel({
       setValidationError('Each manual story needs an ID, title, and description.')
       return
     }
-    if ((options.selected_path || options.focus) && options.analysis_mode === 'FULL') {
-      setValidationError('Selected paths and retrieval focus require INCREMENTAL or UNKNOWN scope.')
+    if (options.selected_path && options.analysis_mode === 'FULL') {
+      setValidationError('Selected paths require INCREMENTAL or UNKNOWN scope.')
       return
     }
     if (codeSource === 'uploads' && !Object.values(uploads).some((files) => files.length) && !keys.length && !stories.length) {
@@ -178,6 +182,11 @@ export function RequirementsPanel({
         </p>
       </header>
       {config.isError && <p role="alert">Backend configuration unavailable: {errorMessage(config.error)}</p>}
+      {config.data?.analysis_prompts_configured === false && (
+        <p role="alert" className="rounded border border-amber-500 p-3">
+          {config.data.analysis_prompt_issue ?? 'The backend analysis prompt is missing or unreadable.'}
+        </p>
+      )}
       {config.data && !config.data.gateway_configured && (
         <p role="alert" className="rounded border border-amber-500 p-3">
           The backend AI gateway endpoint is not configured. Set TIP_GATEWAY_URL to the complete completion endpoint.
@@ -191,12 +200,6 @@ export function RequirementsPanel({
       {config.data && !config.data.persistence_configured && (
         <p role="alert" className="rounded border border-amber-500 p-3">
           SQLite result storage is unavailable. Check that the backend data directory is writable.
-        </p>
-      )}
-      {config.data && (
-        <p role="status" className="text-sm">
-          Indexed-source retrieval: {config.data.rag_configured ? 'optional external RAG file selector available' : 'built-in SQLite full-text search; no RAG model bundled'}
-          {' · '}Result storage: {config.data.persistence_configured ? config.data.persistence_backend : 'Unavailable'}
         </p>
       )}
       <form className="space-y-6" onSubmit={onSubmit}>
@@ -214,21 +217,20 @@ export function RequirementsPanel({
                 <Select id="analysis-mode" value={options.analysis_mode}
                   onChange={(e) => setOptions({ ...options, analysis_mode: e.target.value as AnalysisOptions['analysis_mode'] })}>
                   <option value="INCREMENTAL">Incremental: selected artifacts only</option>
-                  <option value="FULL">Full: I am supplying the complete selected application scope</option>
+                  <option value="FULL">Full: I am supplying the complete selected scope (within model limits)</option>
                   <option value="UNKNOWN">Unknown completeness</option>
                 </Select>
               </div>
             </CardContent>
           </Card>
           <Card>
-            <CardHeader><CardTitle>Application code (optional)</CardTitle></CardHeader>
+            <CardHeader><CardTitle>Application code</CardTitle></CardHeader>
             <CardContent className="space-y-4">
               <Label htmlFor="code-source">Source</Label>
               <Select id="code-source" value={codeSource}
                 onChange={(e) => setCodeSource(e.target.value as AnalysisOptions['code_source'])}>
                 <option value="uploads">Upload files, folder, or ZIP</option>
                 <option value="repository">GitHub / GitLab / Bitbucket repository</option>
-                <option value="indexed">Previously indexed code (retrieve by focus)</option>
                 {config.data?.server_directories_enabled && <option value="local">Allowed server directory</option>}
               </Select>
               {codeSource === 'uploads' && <>
@@ -262,7 +264,8 @@ export function RequirementsPanel({
                   files={uploads.code_files}
                   onChange={(files) => setUploads({ ...uploads, code_files: files })} />
                 <p className="text-sm text-slate-600">
-                  Uploaded code goes directly to analysis. Retrieval is used only when you select previously indexed code.
+                  Every eligible file is analyzed in bounded batches together with the supplied evidence.
+                  {' '}The per-artifact text limit is {config.data?.max_artifact_characters?.toLocaleString() ?? '150,000'} characters; all batches must succeed before a Word document is published.
                 </p>
               </>}
               {codeSource === 'repository' && <div className="grid gap-4 md:grid-cols-2">
@@ -277,7 +280,25 @@ export function RequirementsPanel({
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="selected-path">Selected subdirectory (optional)</Label>
-                  <Input id="selected-path" value={options.selected_path ?? ''} onChange={(e) => setOptions({ ...options, selected_path: e.target.value || undefined })} />
+                  <Input id="selected-path" placeholder="e.g. src/application"
+                    value={options.selected_path ?? ''} onChange={(e) => setOptions({ ...options, selected_path: e.target.value || undefined })} />
+                  <p className="text-sm text-slate-600">
+                    Leave blank to analyze the whole repository. Use a path relative to the repository root; select the branch separately.
+                    {' '}Selected subdirectories use sparse checkout; blob filtering depends on Git host support.
+                  </p>
+                </div>
+                <div className="space-y-2 md:col-span-2">
+                  <Label htmlFor="analysis-focus">Analysis focus (recommended for large repositories)</Label>
+                  <Input id="analysis-focus" maxLength={2000}
+                    placeholder="e.g. order status, authentication, payment flows"
+                    value={options.focus ?? ''}
+                    onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
+                  <p className="text-sm text-slate-600">
+                    {config.data
+                      ? `TIP indexes up to ${config.data.max_repository_files?.toLocaleString() ?? '500,000'} readable files / ${((config.data.max_repository_bytes ?? 5_000_000_000) / 1_000_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB (per-file caps ${((config.data.max_repository_file_bytes ?? 30_000_000) / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB / ${config.data.max_artifact_characters.toLocaleString()} text characters), then analyzes every eligible file in batches of up to ${config.data.analysis_batch_files.toLocaleString()} files / ${config.data.analysis_batch_characters.toLocaleString()} characters. Git clone/checkout operations time out after ${config.data.repository_clone_timeout_seconds?.toLocaleString() ?? '600'} seconds.`
+                      : 'TIP indexes the repository locally and analyzes every eligible file in bounded batches.'}
+                    {' '}Analysis focus guides synthesis; it does not filter files. Large repositories may require many gateway requests. A 504 is retried with smaller batches, but an upstream gateway can still fail.
+                  </p>
                 </div>
               </div>}
               {codeSource === 'local' && <div className="space-y-2">
@@ -285,25 +306,17 @@ export function RequirementsPanel({
                 <Input id="local-path" required value={options.local_path ?? ''}
                   onChange={(e) => setOptions({ ...options, local_path: e.target.value })} />
                 <p className="text-sm">This is a backend server path, not a path on your browser's computer.</p>
-              </div>}
-              {codeSource === 'indexed' && <div className="grid gap-4 md:grid-cols-2">
-                <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-slate-800 md:col-span-2">
-                  <h3 className="font-semibold text-blue-900">How retrieval works</h3>
-                  <p className="mt-1">
-                    This package has no separate RAG model or embeddings. With a focus, it searches the built-in SQLite text index
-                    {config.data?.rag_configured ? ' or asks the configured RAG service to select source-file paths' : ''}.
-                    It then loads the matching actual source files and sends those to the LLM. Leave focus blank to use the indexed source without external RAG selection.
-                  </p>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="repo-id">Indexed repository ID</Label>
-                  <Input id="repo-id" required value={options.indexed_repo_id ?? ''}
-                    onChange={(e) => setOptions({ ...options, indexed_repo_id: e.target.value })} />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="focus">Retrieval focus (optional; partial scope)</Label>
-                  <Input id="focus" value={options.focus ?? ''} onChange={(e) => setOptions({ ...options, focus: e.target.value })} />
-                </div>
+                <Label htmlFor="local-analysis-focus">Analysis focus (recommended for large directories)</Label>
+                <Input id="local-analysis-focus" maxLength={2000}
+                  placeholder="e.g. order status, authentication, payment flows"
+                  value={options.focus ?? ''}
+                  onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
+                <p className="text-sm text-slate-600">
+                  The local index can contain up to {config.data?.max_repository_files?.toLocaleString() ?? '500,000'} readable files.
+                  Every eligible file is analyzed in batches of up to {config.data?.analysis_batch_files?.toLocaleString() ?? '5'} files / {config.data?.analysis_batch_characters?.toLocaleString() ?? '25,000'} characters.
+                  {' '}Analysis focus is guidance, not a file filter; large directories may require many gateway requests.
+                  {' '}Individual artifacts over {config.data?.max_artifact_characters?.toLocaleString() ?? '150,000'} text characters are not included.
+                </p>
               </div>}
             </CardContent>
           </Card>
@@ -374,8 +387,15 @@ export function RequirementsPanel({
             Supporting requirements do not prove implementation. Output is a draft requiring human review.
             Review uploads for secrets before submission.
           </p>
-          <Button type="submit" className="bg-blue-700 text-white shadow-sm hover:bg-blue-800" disabled={!config.data?.gateway_configured || !config.data?.gateway_auth_configured || !config.data?.persistence_configured}>
-            {submit.isPending ? 'Uploading...' : 'Generate requirements & Word document'}
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={automaticDownload}
+              onChange={(event) => setAutomaticDownload(event.target.checked)} />
+            Automatically download the technical Word document when this analysis finishes
+          </label>
+          <Button type="submit" className="bg-blue-700 text-white shadow-sm hover:bg-blue-800"
+            disabled={!config.data?.gateway_configured || !config.data?.gateway_auth_configured
+              || !config.data?.persistence_configured || config.data?.analysis_prompts_configured === false}>
+            {submit.isPending ? 'Uploading...' : 'Generate requirements & Word documents'}
           </Button>
         </fieldset>
       </form>
@@ -388,13 +408,18 @@ export function RequirementsPanel({
         <CardContent className="space-y-3">
           <p>{task.data.status}: {task.data.message}</p>
           <p className="break-all text-sm">Task ID: {task.data.task_id}</p>
+          {task.data.result?.repository_coverage && (
+            <p role="note" className="text-sm">
+              Analyzed {task.data.result.repository_coverage.retrievedCodeFiles.toLocaleString()} of
+              {' '}{task.data.result.repository_coverage.indexedCodeFiles.toLocaleString()} eligible readable code files
+              {' '}across {task.data.result.repository_coverage.analysisBatchCount.toLocaleString()} bounded model batches.
+            </p>
+          )}
           <progress aria-label="Analysis progress" className="w-full" max={100} value={task.data.progress} />
           {task.data.error && <p role="alert" className="text-red-700">{task.data.error}</p>}
           {running && <Button variant="outline" disabled={cancel.isPending} onClick={() => cancel.mutate()}>Cancel analysis</Button>}
-          {task.data.status === 'success' && result && <div className="flex gap-4">
-            <a className="underline" href={requirementsApi.documentUrl(task.data.task_id)}>Download Word document</a>
-            <a className="underline" href={requirementsApi.analysisUrl(task.data.task_id)} target="_blank" rel="noreferrer">Structured analysis JSON</a>
-          </div>}
+          {task.data.status === 'success' && result && <DocumentDownload taskId={task.data.task_id}
+            automatically={downloadTaskId === task.data.task_id} />}
         </CardContent>
       </Card>}
       {result && <Card>

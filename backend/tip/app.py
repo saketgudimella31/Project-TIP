@@ -4,6 +4,8 @@ import io
 import json
 import re
 import subprocess
+import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,11 +16,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
 
 from .config import Settings
+from .documents import mermaid_renderer_configured
 from .extraction import Extractor, safe_path, source_directory
-from .gateway import Gateway
+from .gateway import Gateway, prompt_file_issue
 from .models import AnalysisOptions
 from .service import TaskManager, Upload, repo_identifier
 from .storage import Store
+from .rag_routes import create_rag_router
+from codebase_rag.services.graph.code_graph import CodeGraph, LIMITATIONS
+from codebase_rag.services.knowledge.local_store import Embeddings, LocalKnowledge
+
+logger = logging.getLogger(__name__)
 
 
 class IngestRequest(BaseModel):
@@ -26,6 +34,7 @@ class IngestRequest(BaseModel):
     repo_url: str | None = None
     local_path: str | None = None
     branch: str | None = None
+    selected_path: str | None = None
     mode: str = "full"
     include_globs: list[str] = Field(default_factory=list)
     exclude_globs: list[str] = Field(default_factory=list)
@@ -47,18 +56,37 @@ class ProcessDirectoryRequest(BaseModel):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
-    store = Store(config.data_dir / "tip.sqlite3")
+    graph_path = config.data_dir / ("code.kuzu" if config.graph_backend == "kuzu" else "code-graph.sqlite3")
+    graph = CodeGraph(graph_path, config.graph_backend)
+    knowledge = LocalKnowledge(
+        config.data_dir / "tip.sqlite3",
+        Embeddings(config.embedding_provider, config.embedding_model, config.embedding_dimension),
+        config.rag_chunk_characters,
+    )
+    store = Store(
+        config.data_dir / "tip.sqlite3", graph, knowledge,
+        max_graph_files=config.max_graph_index_files,
+        max_graph_characters=config.max_graph_index_characters,
+        max_knowledge_files=config.max_knowledge_index_files,
+        max_knowledge_characters=config.max_knowledge_index_characters,
+    )
     manager = TaskManager(config, store, Gateway(config))
 
     @asynccontextmanager
     async def lifespan(app):
         store.recover()
-        yield
-        manager.close()
+        try:
+            yield
+        finally:
+            manager.close()
+            graph.close()
 
     app = FastAPI(title="Test Intelligence Platform", version="1.0.0", lifespan=lifespan)
     app.state.manager = manager
     app.state.store = store
+    app.state.graph = graph
+    app.state.knowledge = knowledge
+    app.include_router(create_rag_router(store, knowledge, manager.gateway, config))
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
@@ -79,35 +107,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/health")
     def health():
+        sqlite_connected = store.verify_connectivity()
+        graph_connected = graph.verify_connectivity()
+        prompt_issue = prompt_file_issue()
         return {
-            "status": "healthy",
+            "status": "healthy" if sqlite_connected and graph_connected and not prompt_issue else "degraded",
             "services": {
                 "storage": True, "local_retrieval": True,
                 "task_queue": True,
-                "graph_service": bool(config.rag_base_url),
-                "sqlite_connected": store.verify_connectivity(),
-                "analysis_persistence": store.verify_connectivity(),
+                "graph_service": graph_connected,
+                "sqlite_connected": sqlite_connected,
+                "analysis_persistence": sqlite_connected,
+                "analysis_prompts_configured": prompt_issue is None,
                 "gateway_configured": bool(config.gateway_url),
                 "gateway_auth_configured": config.gateway_auth_configured,
                 "rag_configured": bool(config.rag_base_url),
                 "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
-                "uml_renderer_configured": bool(config.plantuml_jar and config.plantuml_jar.is_file()),
+                "diagram_renderer_configured": mermaid_renderer_configured(),
             },
+            "graph_backend": config.graph_backend,
+            "retrieval_backend": "SQLite FTS5",
+            "embedding_provider": config.embedding_provider,
             "version": "1.0.0",
         }
 
     @app.get("/api/v1/configuration")
     def configuration():
+        prompt_issue = prompt_file_issue()
         return {
             "gateway_configured": bool(config.gateway_url),
             "gateway_auth_configured": config.gateway_auth_configured,
+            "analysis_prompts_configured": prompt_issue is None,
+            "analysis_prompt_issue": prompt_issue,
             "rag_configured": bool(config.rag_base_url),
             "persistence_configured": store.verify_connectivity(),
             "persistence_backend": "SQLite",
+            "graph_backend": config.graph_backend,
+            "graph_configured": graph.verify_connectivity(),
+            "retrieval_backend": "SQLite FTS5",
+            "graph_limitations": LIMITATIONS,
+            "embedding_provider": config.embedding_provider,
+            "semantic_search": config.embedding_provider == "sentence_transformers",
+            "diagram_renderer_configured": mermaid_renderer_configured(),
             "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
             "server_directories_enabled": config.local_source_root is not None,
             "max_upload_bytes": config.max_upload_bytes,
             "max_files": config.max_files,
+            "max_artifact_characters": config.max_artifact_characters,
+            "max_repository_files": config.max_repository_files,
+            "max_repository_bytes": config.max_repository_bytes,
+            "max_repository_file_bytes": config.max_repository_file_bytes,
+            "repository_clone_timeout_seconds": config.repository_clone_timeout_seconds,
+            "max_analysis_files": config.max_analysis_files,
+            "max_analysis_characters": config.max_analysis_characters,
+            "analysis_batch_files": config.analysis_batch_files,
+            "analysis_batch_characters": config.analysis_batch_characters,
+            "max_graph_index_files": config.max_graph_index_files,
+            "max_graph_index_characters": config.max_graph_index_characters,
+            "max_knowledge_index_files": config.max_knowledge_index_files,
+            "max_knowledge_index_characters": config.max_knowledge_index_characters,
             "single_user_local_only": True,
         }
 
@@ -128,6 +186,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 503, "Configure TIP_GATEWAY_URL with the complete completion endpoint before analysis"
             )
+        prompt_issue = prompt_file_issue()
+        if prompt_issue:
+            raise HTTPException(503, prompt_issue)
         if not store.verify_connectivity():
             raise HTTPException(503, "SQLite analysis storage is unavailable; analysis was not sent to the model")
         content_length = request.headers.get("content-length")
@@ -188,6 +249,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Task not found")
         return task
 
+    @app.get("/api/v1/tasks/stats")
+    def queue_stats():
+        return {
+            "counts": {status: store.list_tasks(status, limit=1)["total_count"] for status in
+                       ("pending", "running", "success", "failed", "cancelled")},
+            "max_concurrent_tasks": config.max_concurrent_tasks,
+        }
+
     @app.get("/api/v1/tasks/{task_id}")
     def task(task_id: str):
         return require_task(task_id)
@@ -207,7 +276,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = task.get("result", {}).get("analysis")
         if task["status"] != "success" or not result:
             raise HTTPException(409, "Analysis is not successfully completed")
-        return result
+        return JSONResponse(
+            content=result,
+            headers={
+                "Content-Disposition": f'attachment; filename="TIP-analysis-{task_id}.json"',
+            },
+        )
 
     @app.get("/api/v1/tasks/{task_id}/document")
     def download(task_id: str):
@@ -221,12 +295,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="TIP-requirements-{task_id}.docx"'},
         )
 
-    def filter_files(artifacts, includes, excludes):
-        return [
-            artifact for artifact in artifacts
-            if (not includes or any(fnmatch.fnmatch(artifact.filePath, glob) for glob in includes))
-            and not any(fnmatch.fnmatch(artifact.filePath, glob) for glob in excludes)
-        ]
+    @app.get("/api/v1/tasks/{task_id}/business-document")
+    def download_business_document(task_id: str):
+        task = require_task(task_id)
+        document = store.business_document(task_id)
+        if task["status"] != "success" or document is None:
+            raise HTTPException(409, "Business Word document is not ready")
+        return StreamingResponse(
+            io.BytesIO(document),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="TIP-business-requirements-{task_id}.docx"'
+            },
+        )
 
     @app.post("/api/v1/ingest/repo", status_code=202)
     def ingest(data: IngestRequest):
@@ -245,9 +327,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             manager.progress(task_id, 10, "Reading authorized repository source")
             extractor = Extractor(config)
             with source_directory(
-                config, repo_url=data.repo_url, local_path=data.local_path, branch=data.branch
+                config, repo_url=data.repo_url, local_path=data.local_path,
+                branch=data.branch, selected_path=data.selected_path,
             ) as root:
-                artifacts = extractor.directory(root)
                 if data.since_commit:
                     # Incremental requests still rebuild the complete current index. This
                     # removes deleted files reliably while reporting the actual change count.
@@ -267,17 +349,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     changed_count = len(changed.stdout.decode("utf-8").splitlines())
                 else:
                     changed_count = None
-            artifacts = filter_files(artifacts, data.include_globs, data.exclude_globs)
-            manager.progress(task_id, 70, "Indexing readable source content")
-            manager.check(task_id)
-            store.index(repo_id, artifacts)
+                def selected_artifacts():
+                    for artifact in extractor.iter_directory(root, data.selected_path or ""):
+                        path = artifact.filePath
+                        if (
+                            (not data.include_globs or any(
+                                fnmatch.fnmatch(path, pattern) for pattern in data.include_globs
+                            ))
+                            and not any(
+                                fnmatch.fnmatch(path, pattern) for pattern in data.exclude_globs
+                            )
+                        ):
+                            yield artifact
+
+                index_result = store.index_batches(
+                    repo_id, selected_artifacts(),
+                    batch_size=config.repository_index_batch_files,
+                    check=lambda: manager.check(task_id),
+                    progress=lambda count: manager.progress(
+                        task_id,
+                        min(65, 15 + count * 50 // config.max_repository_files),
+                        f"Indexed {count:,} repository files locally",
+                    ),
+                )
+            if not index_result["files_indexed"]:
+                raise ValueError("No readable code artifacts to index")
+            manager.progress(task_id, 70, "Finalizing the local source index")
+            diagnostic_warnings = []
+            if extractor.excluded_count:
+                diagnostic_warnings.append(
+                    f"Excluded {extractor.excluded_count} sensitive, generated, or dependency paths."
+                )
+            if extractor.unsupported_count:
+                diagnostic_warnings.append(
+                    f"Omitted {extractor.unsupported_count} unsupported or unreadable files."
+                )
             return {
-                "repo_id": repo_id, "files_processed": len(artifacts), "mode": data.mode,
+                "repo_id": repo_id, "files_processed": extractor.file_count,
+                "files_indexed": index_result["files_indexed"],
+                "characters_indexed": index_result["characters_indexed"],
+                "mode": data.mode,
                 "changed_files_count": changed_count,
-                "warnings": extractor.warnings,
+                "warnings": [
+                    *extractor.warnings, *diagnostic_warnings, *index_result["warnings"],
+                ],
+                "graph_backend": index_result["graph_backend"],
                 "excluded_files": extractor.excluded_files,
                 "unsupported_files": extractor.unsupported_files,
-                "index_strategy": "current_scope_snapshot",
+                "index_strategy": "batched_current_scope_snapshot",
             }, None
 
         return {**submit({"kind": "ingest", "repo_url": data.repo_url, "mode": data.mode}, operation),
@@ -300,6 +419,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             repo_id = repo_identifier(name)
             if artifact.sourceType == "CODE":
                 store.index(repo_id, [artifact])
+            if artifact.sourceType != "CODE":
+                knowledge.add_document(repo_id, artifact.content, artifact.sourceName, artifact.model_dump(exclude={"content"}))
             return {"files_processed": 1, "repo_id": repo_id,
                     "artifacts": [artifact.model_dump()]}, None
         return submit({"kind": "document", "filename": data.filename}, operation)
@@ -310,14 +431,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             manager.progress(task_id, 20, "Reading allowed server directory")
             extractor = Extractor(config)
             with source_directory(config, local_path=data.directory_path) as root:
-                artifacts = extractor.directory(root)
-            if not data.recursive:
-                artifacts = [a for a in artifacts if "/" not in a.filePath]
-            artifacts = filter_files(artifacts, data.file_patterns, [])
+                def selected_artifacts():
+                    for artifact in extractor.iter_directory(root, recursive=data.recursive):
+                        if not data.file_patterns or any(
+                            fnmatch.fnmatch(artifact.filePath, pattern)
+                            for pattern in data.file_patterns
+                        ):
+                            yield artifact
+
+                index_result = store.index_batches(
+                    repo_identifier(data.directory_path), selected_artifacts(),
+                    batch_size=config.repository_index_batch_files,
+                    check=lambda: manager.check(task_id),
+                    progress=lambda count: manager.progress(
+                        task_id,
+                        min(75, 20 + count * 55 // config.max_repository_files),
+                        f"Indexed {count:,} directory files locally",
+                    ),
+                )
+            if not index_result["files_indexed"]:
+                raise ValueError("No readable code artifacts to index")
+            diagnostic_warnings = []
+            if extractor.excluded_count:
+                diagnostic_warnings.append(
+                    f"Excluded {extractor.excluded_count} sensitive, generated, or dependency paths."
+                )
+            if extractor.unsupported_count:
+                diagnostic_warnings.append(
+                    f"Omitted {extractor.unsupported_count} unsupported or unreadable files."
+                )
             repo_id = repo_identifier(data.directory_path)
-            store.index(repo_id, artifacts)
-            return {"repo_id": repo_id, "files_processed": len(artifacts),
-                    "warnings": extractor.warnings,
+            return {"repo_id": repo_id, "files_processed": extractor.file_count,
+                    "files_indexed": index_result["files_indexed"],
+                    "characters_indexed": index_result["characters_indexed"],
+                    "warnings": [
+                        *extractor.warnings, *diagnostic_warnings, *index_result["warnings"],
+                    ],
                     "unsupported_files": extractor.unsupported_files}, None
         return submit({"kind": "directory", "local_path": data.directory_path}, operation)
 
@@ -337,9 +486,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/context/pack")
     def context_pack(repoId: str, stage: str = "requirements",
                      budget: int = Query(default=12000, ge=100, le=100_000),
-                     keywords: str = "", focus: str = ""):
+                     keywords: str = "", focus: str = "",
+                     mode: str = Query(default="hybrid", pattern="^(keyword|vector|hybrid)$")):
         # Budget is a character budget, not a claimed tokenizer-specific token count.
-        artifacts = store.retrieve(repoId, focus or keywords, config.max_files)
+        try:
+            artifacts = store.rag_retrieve(repoId, focus or keywords, mode, config.max_files)
+        except (ValueError, RuntimeError, ImportError, sqlite3.Error) as error:
+            logger.exception("RAG context retrieval failed")
+            raise HTTPException(503, "Source context retrieval failed; check backend configuration and logs") from error
         items = []
         used = 0
         for artifact in artifacts:
@@ -359,12 +513,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/v1/graph/impact")
-    def impact(repoId: str, file: str, depth: int = 2, limit: int = 20):
+    def impact(repoId: str, file: str,
+               depth: int = Query(default=2, ge=1, le=5),
+               limit: int = Query(default=20, ge=1, le=100)):
         if not config.rag_base_url:
-            raise HTTPException(
-                501, "Dependency impact requires your existing graph/RAG service; "
-                "local full-text retrieval cannot infer dependency relationships"
-            )
+            try:
+                return store.impact(repoId, file, depth, limit)
+            except KeyError as error:
+                raise HTTPException(404, "File is not indexed in this repository") from error
+            except (RuntimeError, sqlite3.Error) as error:
+                logger.exception("Code graph impact query failed")
+                raise HTTPException(503, "Code graph is unavailable; check backend logs") from error
         try:
             with httpx.Client(timeout=30, follow_redirects=False) as client:
                 response = client.get(

@@ -1,0 +1,112 @@
+import type { Point } from '../../../types.js';
+export type GridRoutingFallbackReason = 'vertex_cap' | 'adjacency_cap' | 'estimated_memory_cap' | 'search_state_cap';
+export declare class GridRoutingResourceLimitError extends Error {
+    readonly reason: GridRoutingFallbackReason;
+    readonly searchStateScope?: "edge" | "invocation" | undefined;
+    constructor(reason: GridRoutingFallbackReason, message: string, searchStateScope?: "edge" | "invocation" | undefined);
+}
+export interface GridRouteInstrumentation {
+    edgeId: string;
+    routeOrder: number;
+    laneOffset: number;
+    routeLength: number;
+    bendCount: number;
+    crossingCount: number;
+    sharedLength: number;
+    boundaryTransitionCount: number;
+    routeSignature: string;
+}
+export interface GridRoutingInstrumentation {
+    containersBuilt: number;
+    baseTopologyBuilds: number;
+    baseVertices: number;
+    baseAdjacencyEntries: number;
+    buildSweepEvents: number;
+    endpointOverlayBuilds: number;
+    endpointOverlayVertices: number;
+    hierarchyPortalPairs: number;
+    hierarchyPortalTransitionLength: number;
+    hierarchyPortalAlternativeAttempts: number;
+    hierarchyPortalAlternativeSelections: number;
+    hierarchyBoundaryTransitions: number;
+    labelOverlayBuilds: number;
+    labelOverlayVertices: number;
+    searches: number;
+    expandedStates: number;
+    maxOpenSet: number;
+    routesFound: number;
+    routesImpossible: number;
+    resourceLimitFallbacks: number;
+    fallbackReasons: Record<GridRoutingFallbackReason, number>;
+    fallbackValidationFailures: number;
+    compatibilitySegments: number;
+    compatibilityFastPathAttempts: number;
+    compatibilityFastPaths: number;
+    compatibilityFastPathValidationFailures: number;
+    compatibilityFastPathNonMinimalRoutes: number;
+    compatibilityRecoveries: number;
+    compatibilityValidationFailures: number;
+    bundleSeparationRelaxations: number;
+    routeLength: number;
+    bendCount: number;
+    crossingCount: number;
+    sharedLength: number;
+    estimatedBytes: number;
+    searchWorkspaceBytes: number;
+    routeOrder: string[];
+    routes: GridRouteInstrumentation[];
+}
+export declare const gridRoutingMetricDisposition: {
+    readonly containersBuilt: "cumulative";
+    readonly baseTopologyBuilds: "cumulative";
+    readonly baseVertices: "cumulative";
+    readonly baseAdjacencyEntries: "cumulative";
+    readonly buildSweepEvents: "cumulative";
+    readonly endpointOverlayBuilds: "cumulative";
+    readonly endpointOverlayVertices: "cumulative";
+    readonly hierarchyPortalPairs: "transactional";
+    readonly hierarchyPortalTransitionLength: "transactional";
+    readonly hierarchyPortalAlternativeAttempts: "cumulative";
+    readonly hierarchyPortalAlternativeSelections: "transactional";
+    readonly hierarchyBoundaryTransitions: "transactional";
+    readonly labelOverlayBuilds: "cumulative";
+    readonly labelOverlayVertices: "cumulative";
+    readonly searches: "cumulative";
+    readonly expandedStates: "cumulative";
+    readonly maxOpenSet: "cumulative";
+    readonly routesFound: "transactional";
+    readonly routesImpossible: "transactional";
+    readonly resourceLimitFallbacks: "cumulative";
+    readonly fallbackReasons: "cumulative";
+    readonly fallbackValidationFailures: "cumulative";
+    readonly compatibilitySegments: "transactional";
+    readonly compatibilityFastPathAttempts: "cumulative";
+    readonly compatibilityFastPaths: "cumulative";
+    readonly compatibilityFastPathValidationFailures: "cumulative";
+    readonly compatibilityFastPathNonMinimalRoutes: "cumulative";
+    readonly compatibilityRecoveries: "transactional";
+    readonly compatibilityValidationFailures: "cumulative";
+    readonly bundleSeparationRelaxations: "transactional";
+    readonly routeLength: "transactional";
+    readonly bendCount: "transactional";
+    readonly crossingCount: "transactional";
+    readonly sharedLength: "transactional";
+    readonly estimatedBytes: "cumulative";
+    readonly searchWorkspaceBytes: "cumulative";
+    readonly routeOrder: "transactional";
+    readonly routes: "transactional";
+};
+type TransactionalGridRoutingMetric = {
+    [K in keyof typeof gridRoutingMetricDisposition]: (typeof gridRoutingMetricDisposition)[K] extends 'transactional' ? K : never;
+}[keyof typeof gridRoutingMetricDisposition];
+type TransactionalGridRoutingValueMetric = Exclude<TransactionalGridRoutingMetric, 'routeOrder' | 'routes'>;
+export interface GridRoutingInstrumentationCheckpoint {
+    routeOrderLength: number;
+    routesLength: number;
+    values: Pick<GridRoutingInstrumentation, TransactionalGridRoutingValueMetric>;
+}
+export declare function createGridRoutingInstrumentationCheckpoint(metrics: GridRoutingInstrumentation): GridRoutingInstrumentationCheckpoint;
+export declare function restoreGridRoutingInstrumentationCheckpoint(metrics: GridRoutingInstrumentation, checkpoint: GridRoutingInstrumentationCheckpoint): void;
+export declare function createGridRoutingInstrumentation(): GridRoutingInstrumentation;
+export declare function recordGridRoute(metrics: GridRoutingInstrumentation, edgeId: string, points: Point[], previousRoutes: readonly Point[][], boundaryTransitionCount?: number, laneOffset?: number): void;
+export {};
