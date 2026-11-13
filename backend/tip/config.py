@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     data_dir: Path = Path("./data")
-    graph_backend: Literal["kuzu", "sqlite"] = "kuzu"
+    graph_backend: Literal["kuzu", "sqlite"] = "sqlite"
     embedding_provider: Literal["hash", "sentence_transformers"] = "hash"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = Field(default=384, ge=32, le=4096)

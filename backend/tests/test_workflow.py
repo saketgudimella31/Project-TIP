@@ -948,20 +948,14 @@ def test_labeled_class_diagram_renders_without_native_resvg_panic(
     assert rendered["classDiagram"].startswith(
         b"\x89PNG\r\n\x1a\n"
     )
-
-    assert "GLReportService --> ReportBuilder" in rendered_sources[0]
-    assert ": creates" not in rendered_sources[0]
-    assert "+generate(report: dict): bytes" not in rendered_sources[0]
-    assert "class GLReportService" in rendered_sources[0]
-
+    
+    assert rendered_sources == [source]
     assert result.umlDiagrams.classDiagram.mermaid == source
-
-    assert any(
+    assert not any(
         "Class member details and relationship captions were omitted"
-        in item
-        for item in result.warnings
+        in warning
+        for warning in result.warnings
     )
-
     assert zipfile.is_zipfile(
         io.BytesIO(create_document(result, rendered))
     )
@@ -970,8 +964,7 @@ def test_labeled_class_diagram_renders_without_native_resvg_panic(
         io.BytesIO(create_business_document(result, rendered))
     )
 
-
-def test_component_diagram_retries_with_safe_mermaid_source(
+def test_component_diagram_render_failure_is_not_silently_omitted(
     tmp_path,
     monkeypatch,
 ):
@@ -979,75 +972,28 @@ def test_component_diagram_retries_with_safe_mermaid_source(
         "server.py",
         b"def delegate_to_rag(): pass\n",
     )
-
     result = sample_result(
         "Local RAG Server",
         input_context(),
         artifacts,
+        with_diagram=True,
     )
 
-    source = (
-        "flowchart LR\n"
-        '  ENTRY["Local RAG Server<br/>Entrypoint"]\n'
-        '  SERVICE["Delegation <b>Service</b>"]\n'
-        "  ENTRY -->|delegates incoming request| SERVICE\n"
-    )
-
-    diagram = result.umlDiagrams.componentDiagram.model_copy(
-        update={
-            "generated": True,
-            "title": (
-                "Component View - "
-                "Local RAG Server Entrypoint Delegation"
-            ),
-            "description": "Local RAG delegation flow.",
-            "mermaid": source,
-            "sourceEvidence": (
-                result.highLevelRequirements[0].sourceEvidence
-            ),
-            "reason": "",
-        }
-    )
-
-    result.umlDiagrams.componentDiagram = diagram
-
+    diagram = result.umlDiagrams.componentDiagram
+    original_source = diagram.mermaid
     attempts = []
 
     def fake_render(candidate):
         attempts.append(candidate.mermaid)
+        raise ValueError("Local Mermaid rendering failed: browser render error")
 
-        if len(attempts) == 1:
-            raise ValueError(
-                "Local Mermaid rendering failed: "
-                "thread '<unnamed>' panicked at "
-                "resvg/src/geom.rs:27:61; "
-                "called `Option::unwrap()` on a `None` value"
-            )
+    monkeypatch.setattr("tip.documents.render_diagram", fake_render)
 
-        return b"\x89PNG\r\n\x1a\nsafe-render"
+    with pytest.raises(ValueError, match="browser render error"):
+        render_generated_diagrams(result)
 
-    monkeypatch.setattr(
-        "tip.documents.render_diagram",
-        fake_render,
-    )
-
-    rendered = render_generated_diagrams(result)
-
-    assert rendered["componentDiagram"].startswith(
-        b"\x89PNG\r\n\x1a\n"
-    )
-
-    assert len(attempts) == 2
-
-    # First attempt contains the original Mermaid.
-    assert "<br/>" in attempts[0]
-    assert "<b>" in attempts[0]
-    assert "|delegates incoming request|" in attempts[0]
-
-    # Retry uses the renderer-safe Mermaid source.
-    assert "<br/>" not in attempts[1]
-    assert "<b>" not in attempts[1]
-    assert "|delegates incoming request|" not in attempts[1]
+    assert attempts == [original_source]
+    assert diagram.mermaid == original_source
 
 def test_jira_integration_extracts_adf_and_custom_acceptance(tmp_path, monkeypatch):
     config = settings(

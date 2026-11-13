@@ -730,57 +730,11 @@ class TaskManager:
         self.progress(
             task_id, 80, "Rendering UML locally and generating both Word documents",
         )
-        
-        
-        
-        try:
-            rendered_diagrams = render_generated_diagrams(
-                result
-            )
-        except Exception as error:
-            rendered_diagrams = {}
 
-            warning = (
-                "One or more UML diagrams could not be rendered locally. "
-                "The requirements documents were generated without rendered "
-                "diagram images. Review the Mermaid source separately."
-            )
+        rendered_diagrams = render_generated_diagrams(result)
+        document = create_document(result, rendered_diagrams)
+        business_document = create_business_document(result, rendered_diagrams)
 
-            if warning not in result.warnings:
-                result.warnings.append(warning)
-
-            if warning not in result.limitations:
-                result.limitations.append(warning)
-
-            if warning not in result.analysisScope.limitations:
-                result.analysisScope.limitations.append(warning)
-
-            logger.warning(
-                "Task %s: UML rendering failed (%s); "
-                "continuing document generation without rendered images",
-                task_id,
-                type(error).__name__,
-            )
-
-
-        document = create_document(
-            result,
-            rendered_diagrams,
-        )
-
-        business_document = create_business_document(
-            result,
-            rendered_diagrams,
-        )
-                
-    
-        
-        
-        
-        
-        
-        
-        
         self.check(task_id)
         indexed_files = (
             self.store.index_stats(repository_id, indexed_scope_prefix)[0]

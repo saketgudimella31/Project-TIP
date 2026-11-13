@@ -51,11 +51,14 @@ def mermaid_renderer_issue() -> str | None:
             "The TIP Mermaid renderer script is missing from backend/tip. "
             "Sync the current backend files and reinstall the backend package."
         )
+        
+        
     packages = {
         "mermaid": frontend / "node_modules" / "mermaid" / "package.json",
         "jsdom": frontend / "node_modules" / "jsdom" / "package.json",
-        "@resvg/resvg-js": frontend / "node_modules" / "@resvg" / "resvg-js" / "package.json",
+        "sharp": frontend / "node_modules" / "sharp" / "package.json",
     }
+
     missing = [name for name, path in packages.items() if not path.is_file()]
     if missing:
         return (
@@ -259,107 +262,15 @@ def render_diagram(diagram: Diagram) -> bytes:
         raise ValueError("Rendered Mermaid image exceeds the size limit")
     return image
 
-
 def render_generated_diagrams(result: AnalysisResult) -> dict[str, bytes]:
-    rendered = {}
+    rendered: dict[str, bytes] = {}
 
-    for reference, original_diagram in result.umlDiagrams.entries():
-        if not original_diagram.generated:
-            continue
-
-        validate_mermaid(original_diagram.mermaid)
-
-        render_source, members_omitted, captions_omitted = (
-            _class_diagram_render_source(original_diagram.mermaid)
-        )
-
-        diagram = original_diagram
-        if render_source != original_diagram.mermaid:
-            diagram = original_diagram.model_copy(
-                update={"mermaid": render_source}
-            )
-
-        if members_omitted or captions_omitted:
-            omitted_parts = []
-
-            if members_omitted:
-                omitted_parts.append("class member details")
-
-            if captions_omitted:
-                omitted_parts.append("relationship captions")
-
-            omitted = (
-                " and ".join(omitted_parts)
-                if len(omitted_parts) == 2
-                else omitted_parts[0]
-            )
-
-            warning = (
-                f"{omitted.capitalize()} were omitted from rendered "
-                "class-diagram images because of a local SVG renderer "
-                "compatibility issue; the original Mermaid source remains "
-                "available in the analysis data."
-            )
-
-            if warning not in result.warnings:
-                result.warnings.append(warning)
-
-        try:
+    for reference, diagram in result.umlDiagrams.entries():
+        if diagram.generated:
             rendered[reference] = render_diagram(diagram)
-            continue
-        except ValueError as first_error:
-            error_text = str(first_error)
 
-            native_renderer_failure = any(
-                marker in error_text
-                for marker in (
-                    "resvg",
-                    "panicked at",
-                    "Option::unwrap()",
-                    "Local Mermaid rendering failed",
-                )
-            )
-
-            if not native_renderer_failure:
-                raise
-
-            safe_source, changed = _safe_mermaid_render_source(
-                diagram.mermaid
-            )
-
-            if not changed or safe_source == diagram.mermaid:
-                raise
-
-            validate_mermaid(safe_source)
-
-            safe_diagram = diagram.model_copy(
-                update={"mermaid": safe_source}
-            )
-
-            try:
-                rendered[reference] = render_diagram(safe_diagram)
-                
-            except ValueError as retry_error:
-                    warning = (
-                        f"The UML diagram '{original_diagram.title}' "
-                        "could not be converted to a PNG by the local renderer. "
-                        "The diagram image was omitted, but the original Mermaid "
-                        "source remains available in the analysis."
-                    )
-
-                    if warning not in result.warnings:
-                        result.warnings.append(warning)
-
-                    if warning not in result.limitations:
-                        result.limitations.append(warning)
-
-                    if warning not in result.analysisScope.limitations:
-                        result.analysisScope.limitations.append(
-                            warning
-                        )
-
-                    continue
     return rendered
+
 
 def ensure_source_component_diagram(result: AnalysisResult) -> bool:
     if any(diagram.generated for _, diagram in result.umlDiagrams.entries()):
@@ -541,33 +452,16 @@ def create_document(
             document.add_paragraph(diagram.description)
             reference = f"{key}[{diagram_index}]" if isinstance(value, list) else key
             
+                
             
             image = rendered_diagrams.get(reference)
-
-            if image is not None:
-                document.add_picture(
-                    io.BytesIO(image),
-                    width=Inches(6),
-                )
-            else:
-                document.add_paragraph(
-                    "The UML image could not be rendered locally. "
-                    "The validated Mermaid source is included below."
+            if not image:
+                raise ValueError(
+                    f"UML diagram '{diagram.title}' has no rendered PNG"
                 )
 
-                document.add_paragraph(
-                    diagram.mermaid
-                )
+            document.add_picture(io.BytesIO(image), width=Inches(6))
 
-            document.add_paragraph(
-                evidence_text(
-                    diagram.sourceEvidence,
-                    limit=10,
-                )
-            )
-            
-
-            
             
     document.add_heading("8. Requirements-to-Source-and-Design Traceability", 1)
     for trace in result.requirementsToDesignTraceability:
@@ -986,6 +880,12 @@ def create_business_document(
         else:
             document.add_paragraph("Not identified in the analyzed artifacts.")
     document.add_heading("4.3 UML Process and System Diagrams", 2)
+    document.add_paragraph(
+        "How to read it: Boxes represent the components, classes, or activities "
+        "named in each diagram. Connections show the relationships or interactions "
+        "supported by the supplied evidence. Review each diagram's description "
+        "and confirm the interpretation with the technical owner."
+    )
     if not generated_diagrams:
         document.add_paragraph(
             "No UML diagrams could be generated from the validated evidence without speculation."
@@ -995,20 +895,15 @@ def create_business_document(
         document.add_paragraph(_business_text(diagram.description, 700))
         
         
-        
         image = rendered_diagrams.get(reference)
+        if not image:
+                raise ValueError(
+                    f"UML diagram '{diagram.title}' has no rendered PNG"
+                )
 
-        if image is not None:
-            document.add_picture(
-                io.BytesIO(image),
-                width=Inches(6),
-            )
-        else:
-            document.add_paragraph(
-                "The diagram image could not be rendered locally. "
-                "The technical requirements document contains the "
-                "validated diagram definition for technical review."
-            )
+        document.add_picture(io.BytesIO(image), width=Inches(6))
+
+    
         
 
     document.add_heading("5. Business Rules and Policy Considerations", 1)

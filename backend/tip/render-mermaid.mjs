@@ -1,34 +1,56 @@
 import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { createSVGWindow } from "svgdom";
 
 const require = createRequire(path.join(process.cwd(), "package.json"));
-const { Resvg } = require("@resvg/resvg-js");
 const { JSDOM } = require("jsdom");
+const sharp = require("sharp");
 
 let source = "";
+
 for await (const chunk of process.stdin) {
   source += chunk;
-  if (source.length > 50_000) throw new Error("Mermaid source exceeds the size limit");
+  if (source.length > 50_000) {
+    throw new Error("Mermaid source exceeds the size limit");
+  }
+}
+
+if (!source.trim()) {
+  throw new Error("Mermaid source is empty");
 }
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
 });
 const { window } = dom;
+
 window.SVGElement.prototype.getBBox = function getBBox() {
-  const fontSize = Number.parseFloat(this.getAttribute("font-size")) || 16;
-  const text = this.textContent?.trim() || "";
-  const width = Number.parseFloat(this.getAttribute("width"))
-    || Math.max(40, text.length * fontSize * 0.62 + 24);
-  const height = Number.parseFloat(this.getAttribute("height"))
-    || Math.max(30, fontSize * 1.5 + 16);
-  return { x: 0, y: 0, width, height };
+  const measurement = createSVGWindow().document.documentElement;
+  measurement.innerHTML = this.outerHTML;
+
+  const element = measurement.firstElementChild;
+  if (!element || typeof element.getBBox !== "function") {
+    throw new Error("Cannot measure Mermaid SVG element");
+  }
+
+  const bounds = element.getBBox();
+
+  return {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+  };
 };
-window.SVGElement.prototype.getComputedTextLength = function getComputedTextLength() {
-  const fontSize = Number.parseFloat(this.getAttribute("font-size")) || 16;
-  return (this.textContent?.length || 0) * fontSize * 0.62;
-};
+
+window.SVGElement.prototype.getComputedTextLength =
+  function getComputedTextLength() {
+    return this.getBBox().width;
+  };
+
 for (const [name, value] of Object.entries({
   window,
   document: window.document,
@@ -42,19 +64,72 @@ for (const [name, value] of Object.entries({
   navigator: window.navigator,
   getComputedStyle: window.getComputedStyle.bind(window),
 })) {
-  Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
+  Object.defineProperty(globalThis, name, {
+    configurable: true,
+    value,
+    writable: true,
+  });
 }
 
-const mermaidUrl = pathToFileURL(require.resolve("mermaid"));
-const { default: mermaid } = await import(mermaidUrl.href);
-mermaid.initialize({
-  startOnLoad: false,
-  securityLevel: "strict",
-  theme: "default",
-  htmlLabels: false,
-  flowchart: { htmlLabels: false, useMaxWidth: true },
-});
-const { svg } = await mermaid.render("tip-generated-diagram", source);
-const png = new Resvg(svg, { fitTo: { mode: "width", value: 1600 } }).render().asPng();
-process.stdout.write(png);
-window.close();
+try {
+  const mermaidUrl = pathToFileURL(require.resolve("mermaid"));
+  const { default: mermaid } = await import(mermaidUrl.href);
+
+    mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "default",
+    themeVariables: {
+      background: "#ffffff",
+      primaryColor: "#e8eef8",
+      primaryTextColor: "#111111",
+      primaryBorderColor: "#334155",
+      lineColor: "#334155",
+      secondaryColor: "#f1f5f9",
+      tertiaryColor: "#ffffff",
+    },
+    htmlLabels: false,
+    flowchart: {
+      htmlLabels: false,
+      useMaxWidth: false,
+    },
+    class: {
+      htmlLabels: false,
+      useMaxWidth: false,
+    },
+  });
+
+  const { svg } = await mermaid.render("tip-generated-diagram", source);
+
+    const png = await sharp(Buffer.from(svg))
+    .resize({ width: 1600 })
+    .flatten({ background: "#ffffff" })
+    .removeAlpha()
+    .png()
+    .toBuffer();
+
+  const stats = await sharp(png).stats();
+  const isSolidColor = stats.channels.every(
+    (channel) => channel.min === channel.max,
+  );
+
+
+    if (isSolidColor) {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "tip-diagram-debug-"),
+    );
+
+    await writeFile(path.join(directory, "diagram.svg"), svg, "utf8");
+    await writeFile(path.join(directory, "diagram.png"), png);
+
+    throw new Error(
+      `Rendering produced a single-color PNG. ` +
+      `Local diagnostic files saved in: ${directory}`,
+    );
+  }
+
+  process.stdout.write(png);
+
+} finally {
+  window.close();
+}

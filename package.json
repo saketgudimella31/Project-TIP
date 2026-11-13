@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "sharp": "^0.35.5",
+    "svgdom": "^0.1.29"
+  }
+}
