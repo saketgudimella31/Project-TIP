@@ -1,7 +1,7 @@
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 SourceType = Literal["CODE", "DESIGN_DOCUMENT", "JIRA_USER_STORY", "RAW_REQUIREMENT"]
 ImplementationStatus = Literal[
@@ -19,7 +19,12 @@ class StrictModel(BaseModel):
 
 class SupportingInputs(StrictModel):
     designDocumentsProvided: bool
-    jiraUserStoriesProvided: bool
+    jiraUserStoriesProvided: bool = Field(
+        validation_alias=AliasChoices(
+            "jiraUserStoriesProvided",
+            "jiraUserstoriesProvided",
+        )
+    )
     rawRequirementsProvided: bool
 
 

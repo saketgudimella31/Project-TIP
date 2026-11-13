@@ -1,26 +1,32 @@
-"""TEST ONLY: a synthetic gateway for deterministic browser checks.
+"""TEST ONLY: real HTTP gateway and rendering with explicitly synthetic AI output.
 
-Never use this app as the production entry point. Production uses
-tip.app:create_app and the real configured gateway, with no synthetic fallback.
+Run two Uvicorn factories on loopback:
+  tests.rag_browser_app:create_gateway (port 9001)
+  tests.rag_browser_app:create_backend (port 8000)
+Never use these factories for production or as a real gateway fallback.
 """
-import tempfile
+
+import os
 from pathlib import Path
+
+from pydantic import SecretStr
 
 from tip.app import create_app
 from tip.config import Settings
-
-from .fixtures import sample_result
-
-directory = tempfile.TemporaryDirectory(prefix="tip-browser-test-")
-app = create_app(Settings(
-    _env_file=None, data_dir=Path(directory.name),
-    gateway_url="https://synthetic-test.invalid/completions",
-))
+from tip.documents import mermaid_renderer_configured
+from .test_rag_replacement import synthetic_gateway_app
 
 
-class SyntheticGateway:
-    def analyze(self, target, context, artifacts, coverage=None):
-        return sample_result(target, context, artifacts)
+def create_gateway():
+    return synthetic_gateway_app([], diagram_enabled=mermaid_renderer_configured())
 
 
-app.state.manager.gateway = SyntheticGateway()
+def create_backend():
+    return create_app(Settings(
+        _env_file=None,
+        data_dir=Path(os.environ["TIP_BROWSER_DATA_DIR"]),
+        graph_backend="kuzu",
+        gateway_url="http://127.0.0.1:9001/ai-gateway/v1/chat/completions",
+        gateway_app_consumer_key=SecretStr("synthetic-consumer"),
+        gateway_hmac_secret=SecretStr("synthetic-secret"),
+    ))

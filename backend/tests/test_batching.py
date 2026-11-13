@@ -2,7 +2,13 @@ import hashlib
 
 from tip.batching import AnalysisAccumulator, iter_artifact_batches
 from tip.models import Artifact, InputContext, SupportingInputs
-from tip.validation import validate_merged_result, validate_result
+from tip.validation import (
+    CHUNK_RELATIVE_CITATION_WARNING,
+    INVALID_DIAGRAM_WARNING,
+    OMITTED_LINE_CITATION_WARNING,
+    validate_merged_result,
+    validate_result,
+)
 
 from .fixtures import sample_result
 
@@ -72,3 +78,115 @@ def test_accumulator_merges_batch_evidence_diagrams_and_traceability():
     ]
     assert merged.analysisScope.analyzedCodeFiles == 2
     assert merged.analysisScope.analysisBatchCount == 2
+
+
+def test_validation_synchronizes_repeated_traceability_fields():
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    result = sample_result("Orders", analysis_context, [source])
+    requirement = result.highLevelRequirements[0]
+    trace = result.requirementsToDesignTraceability[0]
+    trace.requirementSummary = "An inconsistent summary"
+    trace.requirementOrigin = []
+    trace.sourceEvidence = []
+    trace.implementationEvidenceStatus = "IMPLEMENTATION_NOT_EVIDENCED"
+    trace.validationStatus = "PARTIALLY_EVIDENCED"
+
+    validate_result(result, [source], analysis_context, "Orders")
+
+    assert trace.requirementSummary == requirement.requirement
+    assert trace.requirementOrigin == requirement.requirementOrigin
+    assert trace.sourceEvidence == requirement.sourceEvidence
+    assert trace.implementationEvidenceStatus == requirement.implementationEvidenceStatus
+    assert trace.validationStatus == requirement.evidenceStatus
+    assert result.warnings == [
+        "Repeated traceability details were synchronized from their linked requirements "
+        "because the model output disagreed.",
+    ]
+    accumulator = AnalysisAccumulator()
+    accumulator.add(result)
+    merged = accumulator.finish(
+        analysis_context, expected_code_files=1, expected_supporting_artifacts=0,
+    )
+    validate_merged_result(
+        merged, analysis_context, "Orders",
+        expected_code_files=1, expected_supporting_artifacts=0,
+    )
+    assert result.warnings[0] in merged.warnings
+
+
+def test_invalid_generated_diagram_is_omitted_without_failing_analysis():
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    result = sample_result("Orders", analysis_context, [source], with_diagram=True)
+    result.umlDiagrams.componentDiagram.mermaid = "unsupportedDiagram"
+    valid_sequence = result.umlDiagrams.componentDiagram.model_copy(update={
+        "title": "Valid order sequence",
+        "mermaid": "sequenceDiagram\n participant User\n User->>User: submit\n",
+    })
+    invalid_sequence = result.umlDiagrams.componentDiagram.model_copy(update={
+        "title": "Invalid order sequence",
+        "mermaid": "unsupportedDiagram",
+    })
+    result.umlDiagrams.sequenceDiagrams = [invalid_sequence, valid_sequence]
+    result.requirementsToDesignTraceability[0].relevantGeneratedDiagrams.extend([
+        "Invalid order sequence", "sequenceDiagrams[0]",
+        "Valid order sequence", "sequenceDiagrams[1]",
+    ])
+
+    validate_result(result, [source], analysis_context, "Orders")
+
+    assert not result.umlDiagrams.componentDiagram.generated
+    assert [item.title for item in result.umlDiagrams.sequenceDiagrams] == [
+        "Valid order sequence",
+    ]
+    assert result.requirementsToDesignTraceability[0].relevantGeneratedDiagrams == [
+        "Valid order sequence", "sequenceDiagrams[0]",
+    ]
+    assert INVALID_DIAGRAM_WARNING in result.warnings
+
+    accumulator = AnalysisAccumulator()
+    accumulator.add(result)
+    merged = accumulator.finish(
+        analysis_context, expected_code_files=1, expected_supporting_artifacts=0,
+    )
+    validate_merged_result(
+        merged, analysis_context, "Orders",
+        expected_code_files=1, expected_supporting_artifacts=0,
+    )
+    assert not merged.umlDiagrams.componentDiagram.generated
+    assert [item.title for item in merged.umlDiagrams.sequenceDiagrams] == [
+        "Valid order sequence",
+    ]
+    assert INVALID_DIAGRAM_WARNING in merged.warnings
+
+
+def test_validation_converts_chunk_relative_line_citations():
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    source.lineOffset = 40
+    result = sample_result("Orders", analysis_context, [source])
+    evidence = result.highLevelRequirements[0].sourceEvidence[0]
+    evidence.lineStart = 1
+    evidence.lineEnd = 1
+
+    validate_result(result, [source], analysis_context, "Orders")
+
+    assert evidence.lineStart == 41
+    assert evidence.lineEnd == 41
+    assert CHUNK_RELATIVE_CITATION_WARNING in result.warnings
+
+
+def test_validation_omits_unverifiable_line_citation_without_failing():
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    result = sample_result("Orders", analysis_context, [source])
+    evidence = result.highLevelRequirements[0].sourceEvidence[0]
+    evidence.lineStart = 999
+    evidence.lineEnd = 999
+
+    validate_result(result, [source], analysis_context, "Orders")
+
+    assert evidence.lineStart is None
+    assert evidence.lineEnd is None
+    assert OMITTED_LINE_CITATION_WARNING in result.warnings

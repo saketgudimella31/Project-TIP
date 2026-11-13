@@ -1,6 +1,13 @@
 import re
 
-from .models import AnalysisResult, Artifact, Diagram, Evidence, InputContext
+from .models import (
+    AnalysisResult,
+    Artifact,
+    Diagram,
+    Evidence,
+    InputContext,
+    Traceability,
+)
 
 INVALID_DIAGRAM_WARNING = (
     "One or more generated UML diagrams were omitted because their Mermaid source "
@@ -36,39 +43,163 @@ def validate_mermaid(text: str):
     ):
         raise ValueError("External resources, directives, and executable Mermaid content are not allowed")
 
+def _synchronize_traceability(
+    result: AnalysisResult,
+) -> None:
+    requirements = [
+        *result.highLevelRequirements,
+        *result.nonFunctionalRequirements,
+    ]
 
-def _synchronize_traceability(result: AnalysisResult) -> None:
-    requirements = {
+    requirements_by_id = {
         requirement.id: requirement
-        for requirement in [
-            *result.highLevelRequirements, *result.nonFunctionalRequirements,
-        ]
+        for requirement in requirements
     }
+
+    generated_diagram_names: set[str] = set()
+
+    for name, diagram in result.umlDiagrams.entries():
+        if diagram.generated:
+            generated_diagram_names.add(name)
+
+            if diagram.title:
+                generated_diagram_names.add(
+                    diagram.title
+                )
+
+    synchronized = []
+    seen_ids: set[str] = set()
     repaired = False
+
+    #
+    # First repair valid existing traceability objects IN PLACE.
+    #
     for trace in result.requirementsToDesignTraceability:
-        requirement = requirements.get(trace.requirementId)
+        requirement = requirements_by_id.get(
+            trace.requirementId
+        )
+
+        # Remove trace entries for unknown requirements.
         if requirement is None:
+            repaired = True
             continue
+
+        # Remove duplicate trace entries.
+        if trace.requirementId in seen_ids:
+            repaired = True
+            continue
+
+        seen_ids.add(trace.requirementId)
+
+        valid_diagrams = [
+            reference
+            for reference
+            in trace.relevantGeneratedDiagrams
+            if reference in generated_diagram_names
+        ]
+
         if (
-            trace.requirementSummary != requirement.requirement
-            or trace.requirementOrigin != requirement.requirementOrigin
-            or trace.sourceEvidence != requirement.sourceEvidence
-            or trace.implementationEvidenceStatus != requirement.implementationEvidenceStatus
-            or trace.validationStatus != requirement.evidenceStatus
+            trace.requirementSummary
+            != requirement.requirement
+            or trace.requirementOrigin
+            != requirement.requirementOrigin
+            or trace.sourceEvidence
+            != requirement.sourceEvidence
+            or trace.implementationEvidenceStatus
+            != requirement.implementationEvidenceStatus
+            or trace.validationStatus
+            != requirement.evidenceStatus
+            or valid_diagrams
+            != trace.relevantGeneratedDiagrams
         ):
             repaired = True
-        trace.requirementSummary = requirement.requirement
-        trace.requirementOrigin = list(requirement.requirementOrigin)
-        trace.sourceEvidence = list(requirement.sourceEvidence)
-        trace.implementationEvidenceStatus = requirement.implementationEvidenceStatus
-        trace.validationStatus = requirement.evidenceStatus
+
+        #
+        # IMPORTANT:
+        # Update the existing object in place.
+        #
+        trace.requirementSummary = (
+            requirement.requirement
+        )
+
+        trace.requirementOrigin = list(
+            requirement.requirementOrigin
+        )
+
+        trace.sourceEvidence = list(
+            requirement.sourceEvidence
+        )
+
+        trace.implementationEvidenceStatus = (
+            requirement.implementationEvidenceStatus
+        )
+
+        trace.validationStatus = (
+            requirement.evidenceStatus
+        )
+
+        trace.relevantGeneratedDiagrams = (
+            valid_diagrams
+        )
+
+        synchronized.append(trace)
+
+    #
+    # Add traceability ONLY for requirements that are missing.
+    #
+    for requirement in requirements:
+        if requirement.id in seen_ids:
+            continue
+
+        repaired = True
+        seen_ids.add(requirement.id)
+
+        synchronized.append(
+            Traceability(
+                requirementId=requirement.id,
+                requirementSummary=(
+                    requirement.requirement
+                ),
+                requirementOrigin=list(
+                    requirement.requirementOrigin
+                ),
+                sourceEvidence=list(
+                    requirement.sourceEvidence
+                ),
+                implementationEvidenceStatus=(
+                    requirement
+                    .implementationEvidenceStatus
+                ),
+                relevantGeneratedDiagrams=[],
+                relevantDesignElements=[],
+                validationStatus=(
+                    requirement.evidenceStatus
+                ),
+            )
+        )
+
+    #
+    # Put traceability into the same order as requirements.
+    #
+    trace_by_id = {
+        trace.requirementId: trace
+        for trace in synchronized
+    }
+
+    result.requirementsToDesignTraceability = [
+        trace_by_id[requirement.id]
+        for requirement in requirements
+    ]
+    
     if repaired:
         warning = (
             "Repeated traceability details were synchronized from their linked requirements "
             "because the model output disagreed."
         )
+
         if warning not in result.warnings:
             result.warnings.append(warning)
+
 
 
 def _sanitize_invalid_diagrams(result: AnalysisResult) -> None:

@@ -40,8 +40,8 @@ class Store:
         with self.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY, body TEXT NOT NULL, document BLOB,
-                    business_document BLOB
+                    id TEXT PRIMARY KEY, body TEXT NOT NULL, status TEXT,
+                    created_at TEXT, document BLOB, business_document BLOB
                 );
                 CREATE TABLE IF NOT EXISTS artifacts (
                     id INTEGER PRIMARY KEY, repo_id TEXT NOT NULL,
@@ -95,8 +95,26 @@ class Store:
                 );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
-            if "business_document" not in columns:
-                db.execute("ALTER TABLE tasks ADD COLUMN business_document BLOB")
+            for column, definition in (
+                ("business_document", "BLOB"),
+                ("status", "TEXT"),
+                ("created_at", "TEXT"),
+            ):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+                    columns.add(column)
+            for row in db.execute(
+                "SELECT id, body FROM tasks WHERE status IS NULL OR created_at IS NULL"
+            ).fetchall():
+                task = json.loads(row["body"])
+                db.execute(
+                    "UPDATE tasks SET status=?, created_at=? WHERE id=?",
+                    (task["status"], task["created_at"], row["id"]),
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_status_created_at_idx "
+                "ON tasks(status, created_at DESC)"
+            )
 
     @contextmanager
     def connect(self):
@@ -109,7 +127,7 @@ class Store:
             connection.close()
 
     def recover(self):
-        for task in self.list_tasks(limit=100_000)["tasks"]:
+        for task in self.list_tasks(limit=100_000, include_result=False)["tasks"]:
             if task["status"] in {"pending", "running"}:
                 self.update(task["task_id"], status="failed", progress=100,
                             message="Backend restarted before completion",
@@ -121,8 +139,10 @@ class Store:
             "message": "Queued", "created_at": now(), "metadata": metadata,
         }
         with self.connect() as db:
-            db.execute("INSERT INTO tasks(id, body) VALUES (?,?)",
-                       (task["task_id"], json.dumps(task)))
+            db.execute(
+                "INSERT INTO tasks(id, body, status, created_at) VALUES (?,?,?,?)",
+                (task["task_id"], json.dumps(task), task["status"], task["created_at"]),
+            )
         return task
 
     def get(self, task_id: str) -> dict | None:
@@ -137,7 +157,10 @@ class Store:
                 raise KeyError(task_id)
             task.update(fields)
             with self.connect() as db:
-                db.execute("UPDATE tasks SET body=? WHERE id=?", (json.dumps(task), task_id))
+                db.execute(
+                    "UPDATE tasks SET body=?, status=?, created_at=? WHERE id=?",
+                    (json.dumps(task), task["status"], task["created_at"], task_id),
+                )
             return task
 
     def complete(
@@ -155,8 +178,12 @@ class Store:
                 if isinstance(analysis, dict):
                     self._persist_analysis(db, task_id, analysis)
                 db.execute(
-                    "UPDATE tasks SET body=?, document=?, business_document=? WHERE id=?",
-                    (json.dumps(task), document, business_document, task_id),
+                    "UPDATE tasks SET body=?, status=?, created_at=?, document=?, "
+                    "business_document=? WHERE id=?",
+                    (
+                        json.dumps(task), task["status"], task["created_at"],
+                        document, business_document, task_id,
+                    ),
                 )
 
     @staticmethod
@@ -256,16 +283,23 @@ class Store:
             ).fetchone()
         return row["business_document"] if row else None
 
-    def list_tasks(self, status: str | None = None, limit: int = 100) -> dict:
+    def list_tasks(
+        self, status: str | None = None, limit: int = 100, *,
+        include_result: bool = True,
+    ) -> dict:
         with self.connect() as db:
-            clauses = "WHERE json_extract(body, '$.status')=?" if status else ""
+            clauses = "WHERE status=?" if status else ""
             params = (status,) if status else ()
             total = db.execute(f"SELECT count(*) FROM tasks {clauses}", params).fetchone()[0]
             rows = db.execute(
                 f"SELECT body FROM tasks {clauses} "
-                "ORDER BY json_extract(body, '$.created_at') DESC LIMIT ?", (*params, limit),
+                "ORDER BY created_at DESC, id DESC LIMIT ?", (*params, limit),
             ).fetchall()
-        return {"tasks": [json.loads(row["body"]) for row in rows], "total_count": total}
+        tasks = [json.loads(row["body"]) for row in rows]
+        if not include_result:
+            for task in tasks:
+                task.pop("result", None)
+        return {"tasks": tasks, "total_count": total}
 
     def index(
         self, repo_id: str, artifacts: list[Artifact], replace: bool = True, *,

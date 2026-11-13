@@ -2,7 +2,9 @@
   "model": "azure-openai-5-2",
   "temperature": 0.1,
   "max_tokens": 12000,
-  "response_format": { "type": "json_object" },
+  "response_format": {
+    "type": "json_object"
+  },
   "stream": false,
   "messages": []
 }

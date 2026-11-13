@@ -2,9 +2,12 @@ import hashlib
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import PurePosixPath
+from typing import BinaryIO, Callable
 
 import httpx
 from pydantic import ValidationError
@@ -15,10 +18,11 @@ from .documents import (
     DocumentBundle,
     create_business_document,
     create_document,
+    ensure_source_component_diagram,
     render_generated_diagrams,
 )
 from .extraction import Extractor, jira_stories, safe_path, source_directory
-from .gateway import Gateway, GatewayError
+from .gateway import QUOTA_EXHAUSTED_CODES, Gateway, GatewayError
 from .models import AnalysisOptions, Artifact, InputContext, SourceType, SupportingInputs
 from .storage import Store, now
 from .validation import add_backend_warnings, validate_merged_result, validate_result
@@ -32,11 +36,65 @@ class Cancelled(Exception):
     pass
 
 
+class AdaptiveGatewayLimiter:
+    def __init__(self, maximum: int):
+        self.maximum = maximum
+        self.limit = min(2, maximum)
+        self.active = 0
+        self.cooldown_until = 0.0
+        self.successes_since_change = 0
+        self.condition = threading.Condition()
+
+    def acquire(self, check):
+        while True:
+            check()
+            with self.condition:
+                now = time.monotonic()
+                if now >= self.cooldown_until and self.active < self.limit:
+                    self.active += 1
+                    return
+                self.condition.wait(timeout=0.1)
+
+    def release(self, *, success: bool, retry_after: float | None = None):
+        with self.condition:
+            if self.active < 1:
+                raise RuntimeError("Gateway limiter released without an active request")
+            self.active -= 1
+            now = time.monotonic()
+            if retry_after is not None:
+                self.limit = max(1, self.limit // 2)
+                self.successes_since_change = 0
+                self.cooldown_until = max(
+                    self.cooldown_until, now + max(0.0, retry_after),
+                )
+            elif success and now >= self.cooldown_until and self.limit < self.maximum:
+                self.successes_since_change += 1
+                if self.successes_since_change >= self.limit:
+                    self.limit += 1
+                    self.successes_since_change = 0
+            self.condition.notify_all()
+
+
 @dataclass
 class Upload:
     name: str
     content: bytes
     kind: SourceType
+    stream: BinaryIO | None = None
+    size: int = 0
+
+    def artifacts(self, extractor: Extractor):
+        if self.stream is None:
+            yield from extractor.extract(self.name, self.content, self.kind)
+            return
+        self.stream.seek(0)
+        yield from extractor.iter_file(
+            self.name, self.stream, self.kind, file_size=self.size,
+        )
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
 
 
 def repo_identifier(source: str) -> str:
@@ -56,16 +114,22 @@ class TaskManager:
         self.executor = ThreadPoolExecutor(
             max_workers=settings.max_concurrent_tasks, thread_name_prefix="tip"
         )
+        self.gateway_slots = AdaptiveGatewayLimiter(
+            settings.analysis_batch_concurrency
+        )
         self.lock = threading.RLock()
         self.events: dict[str, threading.Event] = {}
+        self.cleanups: dict[str, Callable[[], None]] = {}
 
-    def submit(self, metadata: dict, operation):
+    def submit(self, metadata: dict, operation, cleanup: Callable[[], None] | None = None):
         with self.lock:
             if len(self.events) >= self.settings.max_concurrent_tasks * 4:
                 raise ValueError("Task queue is full; wait for an existing task to finish")
             task = self.store.create(metadata)
             event = threading.Event()
             self.events[task["task_id"]] = event
+            if cleanup is not None:
+                self.cleanups[task["task_id"]] = cleanup
             self.executor.submit(self.run, task["task_id"], event, operation)
         return task
 
@@ -148,6 +212,12 @@ class TaskManager:
         finally:
             with self.lock:
                 self.events.pop(task_id, None)
+                cleanup = self.cleanups.pop(task_id, None)
+            if cleanup is not None:
+                try:
+                    cleanup()
+                except OSError:
+                    logger.exception("Task %s could not clean up staged uploads", task_id)
 
     def cancel(self, task_id: str):
         with self.lock:
@@ -167,8 +237,13 @@ class TaskManager:
     def close(self):
         with self.lock:
             for task_id in list(self.events):
-                self.cancel(task_id)
+                task = self.store.get(task_id)
+                if task and task["status"] in {"pending", "running"}:
+                    self.cancel(task_id)
         self.executor.shutdown(wait=True, cancel_futures=False)
+        close_gateway = getattr(self.gateway, "close", None)
+        if callable(close_gateway):
+            close_gateway()
 
     def retrieve(
         self, repo_id: str, focus: str, limit: int | None = None,
@@ -215,19 +290,19 @@ class TaskManager:
     def analyze(self, task_id: str, options: AnalysisOptions, uploads: list[Upload]):
         extractor = Extractor(self.settings)
         self.progress(task_id, 10, "Extracting and normalizing source artifacts")
-        uploaded_artifacts: list[Artifact] = []
         code_uploads = [u for u in uploads if u.kind == "CODE"]
         if options.code_source != "uploads" and code_uploads:
             raise ValueError("Code uploads cannot be combined with a different code source")
         if options.selected_path and options.code_source == "uploads":
             raise ValueError("Use folder/file selection for uploads instead of a repository path")
+        supporting_artifacts: list[Artifact] = []
         for upload in uploads:
+            if upload.kind == "CODE":
+                continue
             self.check(task_id)
-            uploaded_artifacts.extend(extractor.extract(upload.name, upload.content, upload.kind))
-        uploaded_artifacts.extend(jira_stories(options.jira_issue_keys, self.settings, extractor))
-        uploaded_artifacts.extend(extractor.story(story) for story in options.manual_stories)
-        code = [a for a in uploaded_artifacts if a.sourceType == "CODE"]
-        supporting_artifacts = [a for a in uploaded_artifacts if a.sourceType != "CODE"]
+            supporting_artifacts.extend(upload.artifacts(extractor))
+        supporting_artifacts.extend(jira_stories(options.jira_issue_keys, self.settings, extractor))
+        supporting_artifacts.extend(extractor.story(story) for story in options.manual_stories)
         source = {
             "repository": options.repo_url, "local": options.local_path,
             "indexed": options.indexed_repo_id, "uploads": None,
@@ -288,19 +363,34 @@ class TaskManager:
                 repository_id, indexed_scope_prefix,
                 batch_size=self.settings.repository_index_batch_files,
             )
-        elif code:
-            source = "uploads:" + "|".join(f"{a.filePath}:{a.sha256}" for a in code)
+        elif code_uploads:
+            source = "uploads:" + task_id + ":" + "|".join(
+                f"{upload.name}:{upload.size or len(upload.content)}"
+                for upload in code_uploads
+            )
             repository_id = repo_identifier(source)
-            self.progress(task_id, 20, "Preparing code context for analysis")
-            graph_result = self.store.index(repository_id, code)
-            index_result = {
-                "files_indexed": len(code),
-                "characters_indexed": sum(len(a.content) for a in code),
-                "warnings": graph_result.get("warnings", []),
-            }
-            code_file_count = len(code)
+            self.progress(task_id, 20, "Indexing uploaded code in bounded local batches")
+
+            def uploaded_code_artifacts():
+                for upload in code_uploads:
+                    self.check(task_id)
+                    yield from upload.artifacts(extractor)
+
+            index_result = self.store.index_batches(
+                repository_id, uploaded_code_artifacts(),
+                batch_size=self.settings.repository_index_batch_files,
+                check=lambda: self.check(task_id),
+                progress=lambda count: self.progress(
+                    task_id,
+                    min(35, 20 + count * 15 // max(self.settings.max_files, 1)),
+                    f"Indexed {count:,} uploaded code files locally",
+                ),
+            )
+            code_file_count = index_result["files_indexed"]
             code_character_count = index_result["characters_indexed"]
-            code_factory = lambda: iter(code)
+            code_factory = lambda: self.store.iter_artifacts(
+                repository_id, batch_size=self.settings.repository_index_batch_files,
+            )
         if not code_file_count and not supporting_artifacts:
             raise ValueError("NO_ANALYZABLE_INPUT: provide readable code, design, stories, or requirements")
 
@@ -371,12 +461,25 @@ class TaskManager:
         accumulator = AnalysisAccumulator()
         completed_characters = 0
         successful_batches = 0
-        request_count = 0
-        last_progress = 40
+        progress_value = [40]
+        progress_lock = threading.Lock()
+        request_lock = threading.Lock()
+
+        def smaller_batches(batch: list[Artifact]) -> list[list[Artifact]]:
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                return [batch[:midpoint], batch[midpoint:]]
+            if batch and len(batch[0].content) > MIN_ADAPTIVE_CHUNK_CHARACTERS:
+                return list(iter_artifact_batches(
+                    batch, max_files=1,
+                    max_characters=max(
+                        MIN_ADAPTIVE_CHUNK_CHARACTERS,
+                        len(batch[0].content) // 2,
+                    ),
+                ))
+            return []
 
         def analyze_batch(batch: list[Artifact]):
-            nonlocal completed_characters, successful_batches, request_count, last_progress
-            self.check(task_id)
             batch_code = [item for item in batch if item.sourceType == "CODE"]
             batch_coverage = {
                 "indexedCodeFiles": code_file_count,
@@ -386,20 +489,6 @@ class TaskManager:
                 "retrievedCharacters": sum(len(item.content) for item in batch_code),
                 "selectionMethod": "all-file bounded batch analysis",
             }
-
-            def smaller_batches():
-                if len(batch) > 1:
-                    midpoint = len(batch) // 2
-                    return [batch[:midpoint], batch[midpoint:]]
-                if len(batch[0].content) > MIN_ADAPTIVE_CHUNK_CHARACTERS:
-                    return list(iter_artifact_batches(
-                        batch, max_files=1,
-                        max_characters=max(
-                            MIN_ADAPTIVE_CHUNK_CHARACTERS,
-                            len(batch[0].content) // 2,
-                        ),
-                    ))
-                return []
 
             batch_context = context.model_copy(update={
                 "supportingInputs": SupportingInputs(
@@ -414,69 +503,167 @@ class TaskManager:
                     ),
                 ),
             })
-            retry_attempt = 0
+            timeout_attempt = 0
             while True:
                 self.check(task_id)
-                request_count += 1
-                batch_coverage["batchRequestNumber"] = request_count
+                with request_lock:
+                    request_count_holder[0] += 1
+                    batch_coverage["batchRequestNumber"] = request_count_holder[0]
+                rate_limit_delay = None
                 try:
-                    result = self.gateway.analyze(
-                        options.target_application, batch_context, batch,
-                        coverage=batch_coverage,
-                    )
+                    self.gateway_slots.acquire(lambda: self.check(task_id))
+                    request_succeeded = False
+                    try:
+                        self.check(task_id)
+                        result = self.gateway.analyze(
+                            options.target_application, batch_context, batch,
+                            coverage=batch_coverage,
+                        )
+                        request_succeeded = True
+                    except GatewayError as error:
+                        if error.status_code == 429:
+                            rate_limit_delay = max(error.retry_after or 0.0, 1.0)
+                        raise
+                    finally:
+                        self.gateway_slots.release(
+                            success=request_succeeded,
+                            retry_after=rate_limit_delay,
+                        )
                 except GatewayError as error:
+                    if error.status_code == 429:
+                        if error.error_code in QUOTA_EXHAUSTED_CODES:
+                            raise ValueError(
+                                "The AI gateway reports exhausted model quota "
+                                f"({error.error_code}). Check the model deployment's "
+                                "quota or billing; reducing parallelism cannot resolve it."
+                            ) from error
+                        error_code = (
+                            f" ({error.error_code})" if error.error_code else ""
+                        )
+                        retry_after = (
+                            f" The gateway requested a wait of at least "
+                            f"{error.retry_after:g} seconds before another request."
+                            if error.retry_after is not None else ""
+                        )
+                        raise ValueError(
+                            "The AI gateway rejected this request with HTTP 429"
+                            f"{error_code}. This is an upstream request/token rate "
+                            "limit, not the number of uploaded files. TIP stopped this "
+                            "analysis instead of retrying automatically. Check the "
+                            "gateway/model quota and retry when capacity is available."
+                            f"{retry_after}"
+                        ) from error
                     if error.status_code != 504:
                         raise
-                    smaller = smaller_batches()
+                    smaller = smaller_batches(batch)
                     if smaller:
-                        for sub_batch in smaller:
-                            analyze_batch(sub_batch)
-                        return
-                    retry_attempt += 1
-                    delay = min(60.0, 2 ** min(retry_attempt - 1, 6))
+                        return ("split", smaller)
+                    timeout_attempt += 1
+                    delay = min(60.0, 2 ** min(timeout_attempt - 1, 6))
                     message = (
                         "The AI gateway timed out on the smallest batch; "
-                        f"retrying in {delay:g} seconds (attempt {retry_attempt})"
+                        f"retrying in {delay:g} seconds (attempt {timeout_attempt})"
                     )
                     logger.warning("Task %s: %s", task_id, message)
-                    self.progress(task_id, last_progress, message)
+                    with progress_lock:
+                        self.progress(task_id, progress_value[0], message)
                     self._wait_for_gateway_retry(task_id, delay)
                     continue
                 except ValueError as error:
                     if str(error).startswith("Model input exceeds the configured context limit"):
-                        smaller = smaller_batches()
+                        smaller = smaller_batches(batch)
                         if smaller:
-                            for sub_batch in smaller:
-                                analyze_batch(sub_batch)
-                            return
+                            return ("split", smaller)
                     raise
                 break
 
             self.check(task_id)
             validate_result(result, batch, context, options.target_application)
-            accumulator.add(result)
-            successful_batches += 1
-            completed_characters += sum(len(item.content) for item in batch)
-            progress = 40 + min(
-                32, completed_characters * 32 // max(total_artifact_characters, 1),
-            )
-            if progress > last_progress:
-                last_progress = progress
-                self.progress(
-                    task_id, progress, f"Analyzed {completed_characters:,} of "
-                    f"{total_artifact_characters:,} source characters "
-                    f"across {successful_batches:,} model batches",
-                )
+            return ("complete", (result, sum(len(item.content) for item in batch)))
 
-        for batch in iter_artifact_batches(
+        request_count_holder = [0]
+        batch_iterator = iter(iter_artifact_batches(
             _all_artifacts(code_factory, supporting_artifacts),
             max_files=self.settings.analysis_batch_files,
             max_characters=min(
                 self.settings.analysis_batch_characters,
                 self.settings.max_analysis_characters,
             ),
-        ):
-            analyze_batch(batch)
+        ))
+        batch_parallelism = self.settings.analysis_batch_concurrency
+        batch_executor = ThreadPoolExecutor(
+            max_workers=batch_parallelism,
+            thread_name_prefix=f"tip-batch-{task_id[:8]}",
+        )
+        active_futures = set()
+        try:
+            while True:
+                initial_batches = list(islice(batch_iterator, batch_parallelism))
+                if not initial_batches:
+                    break
+                pending = deque(
+                    ((root_index,), batch)
+                    for root_index, batch in enumerate(initial_batches)
+                )
+                futures = {}
+                leaf_results = {}
+                split_counts = {}
+                while pending or futures:
+                    self.check(task_id)
+                    while pending and len(futures) < batch_parallelism:
+                        path, batch = pending.popleft()
+                        future = batch_executor.submit(analyze_batch, batch)
+                        futures[future] = path
+                        active_futures.add(future)
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        path = futures.pop(future)
+                        active_futures.discard(future)
+                        outcome, value = future.result()
+                        if outcome == "split":
+                            split_counts[path] = len(value)
+                            for child_index in reversed(range(len(value))):
+                                pending.appendleft((
+                                    path + (child_index,), value[child_index],
+                                ))
+                            continue
+
+                        result, characters = value
+                        leaf_results[path] = result
+                        successful_batches += 1
+                        completed_characters += characters
+                        progress = 40 + min(
+                            32,
+                            completed_characters * 32 // max(total_artifact_characters, 1),
+                        )
+                        with progress_lock:
+                            if progress > progress_value[0]:
+                                progress_value[0] = progress
+                                self.progress(
+                                    task_id, progress, f"Analyzed {completed_characters:,} of "
+                                    f"{total_artifact_characters:,} source characters "
+                                    f"across {successful_batches:,} model batches",
+                                )
+
+                def ordered_results(path):
+                    if path in leaf_results:
+                        yield leaf_results[path]
+                        return
+                    child_count = split_counts.get(path)
+                    if child_count is None:
+                        raise RuntimeError("Parallel batch result was incomplete")
+                    for child_index in range(child_count):
+                        yield from ordered_results(path + (child_index,))
+
+                for root_index in range(len(initial_batches)):
+                    for result in ordered_results((root_index,)):
+                        accumulator.add(result)
+        except BaseException:
+            for future in active_futures:
+                future.cancel()
+            raise
+        finally:
+            batch_executor.shutdown(wait=True, cancel_futures=True)
 
         result = accumulator.finish(
             context,
@@ -488,6 +675,8 @@ class TaskManager:
             expected_code_files=code_file_count,
             expected_supporting_artifacts=len(supporting_ids),
         )
+        if code_file_count:
+            ensure_source_component_diagram(result)
         coverage = None
         if code_file_count:
             coverage = {
@@ -541,9 +730,57 @@ class TaskManager:
         self.progress(
             task_id, 80, "Rendering UML locally and generating both Word documents",
         )
-        rendered_diagrams = render_generated_diagrams(result)
-        document = create_document(result, rendered_diagrams)
-        business_document = create_business_document(result, rendered_diagrams)
+        
+        
+        
+        try:
+            rendered_diagrams = render_generated_diagrams(
+                result
+            )
+        except Exception as error:
+            rendered_diagrams = {}
+
+            warning = (
+                "One or more UML diagrams could not be rendered locally. "
+                "The requirements documents were generated without rendered "
+                "diagram images. Review the Mermaid source separately."
+            )
+
+            if warning not in result.warnings:
+                result.warnings.append(warning)
+
+            if warning not in result.limitations:
+                result.limitations.append(warning)
+
+            if warning not in result.analysisScope.limitations:
+                result.analysisScope.limitations.append(warning)
+
+            logger.warning(
+                "Task %s: UML rendering failed (%s); "
+                "continuing document generation without rendered images",
+                task_id,
+                type(error).__name__,
+            )
+
+
+        document = create_document(
+            result,
+            rendered_diagrams,
+        )
+
+        business_document = create_business_document(
+            result,
+            rendered_diagrams,
+        )
+                
+    
+        
+        
+        
+        
+        
+        
+        
         self.check(task_id)
         indexed_files = (
             self.store.index_stats(repository_id, indexed_scope_prefix)[0]

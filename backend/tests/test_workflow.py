@@ -5,10 +5,12 @@ import io
 import json
 import os
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import httpx
@@ -24,7 +26,9 @@ from tip.config import Settings
 from tip.documents import (
     create_business_document,
     create_document,
+    ensure_source_component_diagram,
     mermaid_renderer_configured,
+    mermaid_renderer_issue,
     render_diagram,
     render_generated_diagrams,
 )
@@ -37,10 +41,45 @@ from codebase_rag.services.knowledge.local_store import Embeddings, LocalKnowled
 
 from .fixtures import sample_result
 
+def png_chunk(kind, data):
+    return (
+        struct.pack(">I", len(data)) + kind + data
+        + struct.pack(">I", zlib.crc32(kind + data))
+    )
+
+
+TEST_PNG = b"\x89PNG\r\n\x1a\n" + b"".join((
+    png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)),
+    png_chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff")),
+    png_chunk(b"IEND", b""),
+))
 
 def settings(tmp_path, **values):
-    return Settings(_env_file=None, data_dir=tmp_path, **values)
+    defaults = {
+        "gateway_url": "",
+        "gateway_api_key": SecretStr(""),
+        "gateway_app_consumer_key": SecretStr(""),
+        "gateway_hmac_secret": SecretStr(""),
+        "gateway_headers_json": SecretStr(json.dumps({
+            "api-key": "{api_key}",
+            "Timestamp": "{timestamp}",
+            "Client-Request-Id": "{request_id}",
+            "Authorization": "{signature}",
+            "Accept": "application/json",
+        })),
+        "gateway_signature_template": (
+            "{api_key}{request_id}{timestamp}{body}"
+        ),
+        "analysis_batch_concurrency": 2,
+    }
 
+    defaults.update(values)
+
+    return Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        **defaults,
+    )
 
 def test_store_migrates_business_document_column(tmp_path):
     database_path = tmp_path / "legacy.db"
@@ -48,14 +87,51 @@ def test_store_migrates_business_document_column(tmp_path):
         db.execute(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, body TEXT NOT NULL, document BLOB)"
         )
+        db.execute(
+            "INSERT INTO tasks(id, body) VALUES (?, ?)",
+            (
+                "legacy-task",
+                json.dumps({
+                    "task_id": "legacy-task", "status": "failed",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }),
+            ),
+        )
     store = Store(database_path)
     task = store.create({"kind": "test"})
     store.complete(task["task_id"], {"test": True}, b"technical", b"business")
     assert store.document(task["task_id"]) == b"technical"
     assert store.business_document(task["task_id"]) == b"business"
+    assert store.list_tasks("failed", include_result=False)["tasks"][0]["task_id"] == "legacy-task"
     with store.connect() as db:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
-    assert "business_document" in columns
+    assert {"business_document", "status", "created_at"}.issubset(columns)
+
+
+def test_task_history_can_omit_large_results(tmp_path):
+    app = create_app(settings(tmp_path))
+    store = app.state.store
+    completed = store.create({"kind": "analysis", "target_application": "Large"})
+    store.complete(completed["task_id"], {"large_output": "x" * 50_000}, b"doc")
+    failed = store.create({"kind": "analysis", "target_application": "Failed"})
+    store.update(
+        failed["task_id"], status="failed", progress=100, message="Failed",
+        error="Renderer failure",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/tasks", params={"include_result": "false"})
+        full_response = client.get("/api/v1/tasks")
+
+    assert response.status_code == 200
+    history = response.json()
+    assert history["total_count"] == 2
+    assert {item["status"] for item in history["tasks"]} == {"success", "failed"}
+    assert all("result" not in item for item in history["tasks"])
+    completed_task = next(
+        item for item in full_response.json()["tasks"] if item["status"] == "success"
+    )
+    assert completed_task["result"]["large_output"] == "x" * 50_000
 
 
 def test_gateway_repairs_missing_functional_capability_and_warns(tmp_path, monkeypatch):
@@ -88,6 +164,19 @@ def input_context(**changes):
     )
 
 
+def test_input_context_accepts_miscased_jira_story_flag():
+    context = input_context().model_dump()
+    supporting_inputs = context["supportingInputs"]
+    supporting_inputs["jiraUserstoriesProvided"] = supporting_inputs.pop(
+        "jiraUserStoriesProvided",
+    )
+
+    parsed = InputContext.model_validate(context)
+
+    assert parsed.supportingInputs.jiraUserStoriesProvided is False
+    assert "jiraUserStoriesProvided" in parsed.supportingInputs.model_dump()
+
+
 def workbook_bytes():
     workbook = openpyxl.Workbook()
     sheet = workbook.active
@@ -112,16 +201,32 @@ def docx_bytes():
     return stream.getvalue()
 
 
-def wait_task(client, task_id):
-    for _ in range(500):
+def wait_task(client, task_id, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    last_task = None
+
+    while time.monotonic() < deadline:
         response = client.get(f"/api/v1/tasks/{task_id}")
         assert response.status_code == 200
-        task = response.json()
-        if task["status"] not in {"pending", "running"}:
-            return task
-        time.sleep(0.01)
-    raise AssertionError("Task did not complete")
 
+        last_task = response.json()
+
+        if last_task["status"] not in {"pending", "running"}:
+            return last_task
+
+        time.sleep(0.05)
+
+    status = last_task.get("status", "unknown") if last_task else "unknown"
+    message = (
+        last_task.get("message", "unavailable")
+        if last_task
+        else "unavailable"
+    )
+
+    raise AssertionError(
+        f"Task did not complete within {timeout:.1f} seconds; "
+        f"last status={status}; message={message}"
+    )
 
 def test_office_extraction_preserves_provenance(tmp_path):
     extractor = Extractor(settings(tmp_path))
@@ -158,6 +263,54 @@ def test_archive_rejects_traversal(tmp_path, filename):
         archive.writestr(filename, "code")
     with pytest.raises(ValueError, match="Unsafe"):
         Extractor(settings(tmp_path)).extract("code.zip", stream.getvalue())
+
+
+def test_code_zip_streaming_applies_archive_limits_separately(tmp_path):
+    config = settings(tmp_path, max_files=1, max_archive_files=2, max_archive_entries=2)
+    archive_data = io.BytesIO()
+    with zipfile.ZipFile(archive_data, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("src/orders.py", "#" * 100_000)
+        archive.writestr("src/payments.py", "#" * 100_000)
+
+    class TrackingZipStream(io.BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.unbounded_read_positions = []
+
+        def read(self, size=-1):
+            if size < 0:
+                self.unbounded_read_positions.append(self.tell())
+            return super().read(size)
+
+    extractor = Extractor(config)
+    source = TrackingZipStream(archive_data.getvalue())
+    artifacts = list(extractor.iter_file(
+        "source.zip", source, file_size=len(archive_data.getvalue()),
+    ))
+    artifacts.extend(extractor.iter_file(
+        "extra.py", io.BytesIO(b"value = 1"), file_size=len(b"value = 1"),
+    ))
+
+    assert [item.filePath for item in artifacts] == [
+        "src/orders.py", "src/payments.py", "extra.py",
+    ]
+    assert all(
+        position >= len(archive_data.getvalue()) - 70_000
+        for position in source.unbounded_read_positions
+    )
+    assert extractor.file_count == 3
+    assert extractor.file_counts == {"archive": 2, "upload": 1}
+
+
+def test_code_zip_rejects_entry_count_over_limit(tmp_path):
+    archive_data = io.BytesIO()
+    with zipfile.ZipFile(archive_data, "w") as archive:
+        archive.writestr("one.py", "one = 1")
+        archive.writestr("two.py", "two = 2")
+    extractor = Extractor(settings(tmp_path, max_archive_entries=1))
+
+    with pytest.raises(ValueError, match="too many entries"):
+        extractor.extract("source.zip", archive_data.getvalue())
 
 
 def test_secrets_and_unsupported_sources_are_not_analyzed(tmp_path):
@@ -265,8 +418,8 @@ def test_repository_limits_are_separate_and_failed_index_does_not_publish(tmp_pa
 
 
 def test_repository_stream_indexes_more_than_50000_files_with_bounded_retrieval(tmp_path):
-    assert Settings(_env_file=None).max_repository_files == 500_000
-    assert Settings(_env_file=None).max_repository_bytes == 5_000_000_000
+    assert Settings(_env_file=None).max_repository_files == 1_000_000
+    assert Settings(_env_file=None).max_repository_bytes == 10_000_000_000
     source = tmp_path / "large-source"
     source.mkdir()
     for index in range(50_000):
@@ -299,8 +452,10 @@ def test_repository_stream_indexes_more_than_50000_files_with_bounded_retrieval(
     assert extractor.file_count == 50_001
 
 
-def test_repository_extractor_enforces_500000_file_default(tmp_path, monkeypatch):
-    extractor = Extractor(Settings(_env_file=None, data_dir=tmp_path))
+def test_repository_extractor_enforces_configured_file_limit(tmp_path, monkeypatch):
+    extractor = Extractor(Settings(
+        _env_file=None, data_dir=tmp_path, max_repository_files=500_000,
+    ))
     filenames = [f"ignored-{index:06}.bin" for index in range(500_001)]
     fake_stat = type("FakeStat", (), {"st_size": 1})()
     monkeypatch.setattr(
@@ -473,6 +628,35 @@ def test_gateway_http_contract_and_truncated_output(tmp_path, monkeypatch):
         Gateway(config).analyze("Orders", input_context(), artifacts)
     assert error.value.status_code == 504
 
+    def rate_limited(request):
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "2"},
+            json={"error": {"code": "rate_limit_exceeded"}},
+        )
+
+    monkeypatch.setattr("tip.gateway.httpx.Client",
+                        lambda **kwargs: client_type(transport=httpx.MockTransport(rate_limited), **kwargs))
+    with pytest.raises(GatewayError, match="HTTP 429") as error:
+        Gateway(config).analyze("Orders", input_context(), artifacts)
+    assert error.value.status_code == 429
+    assert error.value.retry_after == 2
+    assert error.value.error_code == "rate_limit_exceeded"
+
+    def rate_limited_milliseconds(request):
+        return httpx.Response(
+            429,
+            headers={"retry-after-ms": "1500"},
+            json={"error": {"type": "insufficient_quota"}},
+        )
+
+    monkeypatch.setattr("tip.gateway.httpx.Client",
+                        lambda **kwargs: client_type(transport=httpx.MockTransport(rate_limited_milliseconds), **kwargs))
+    with pytest.raises(GatewayError, match="HTTP 429") as error:
+        Gateway(config).analyze("Orders", input_context(), artifacts)
+    assert error.value.retry_after == 1.5
+    assert error.value.error_code == "insufficient_quota"
+
 
 def test_validation_rejects_unknown_evidence_and_false_implementation(tmp_path):
     extractor = Extractor(settings(tmp_path))
@@ -511,56 +695,159 @@ def test_mermaid_rendering_reports_missing_node(tmp_path, monkeypatch):
         render_diagram(result.umlDiagrams.componentDiagram)
 
 
-def test_missing_mermaid_renderer_falls_back_without_blocking_documents(tmp_path, monkeypatch):
+def test_missing_mermaid_script_has_actionable_configuration_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tip.documents._renderer_paths",
+        lambda: (tmp_path, tmp_path / "render-mermaid.mjs"),
+    )
+    monkeypatch.setattr("tip.documents.shutil.which", lambda _: "/usr/bin/node")
+
+    issue = mermaid_renderer_issue()
+
+    assert issue is not None
+    assert "missing from backend/tip" in issue
+    assert "Sync the current backend files" in issue
+
+
+def test_mermaid_renderer_error_reports_native_panic_cause(tmp_path, monkeypatch):
+    artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"def order_status(): pass")
+    result = sample_result("Orders", input_context(), artifacts, with_diagram=True)
+    monkeypatch.setattr("tip.documents.mermaid_renderer_issue", lambda: None)
+    monkeypatch.setattr("tip.documents.shutil.which", lambda _: "/usr/bin/node")
+    monkeypatch.setattr(
+        "tip.documents.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["node"], returncode=134, stdout=b"",
+            stderr=(
+                b"thread '<unnamed>' panicked at resvg/src/geom.rs:27:61:\n"
+                b"called `Option::unwrap()` on a `None` value\n"
+                b"note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError) as error:
+        render_diagram(result.umlDiagrams.componentDiagram)
+
+    assert "Option::unwrap()" in str(error.value)
+    assert "RUST_BACKTRACE" not in str(error.value)
+
+
+def test_missing_mermaid_renderer_rejects_generated_diagrams(tmp_path, monkeypatch):
     artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"def order_status(): pass")
     result = sample_result("Orders", input_context(), artifacts, with_diagram=True)
     monkeypatch.setattr("tip.documents.shutil.which", lambda _: None)
 
+    with pytest.raises(ValueError, match="Local Mermaid rendering is unavailable"):
+        render_generated_diagrams(result)
+    with pytest.raises(ValueError, match="has no rendered PNG"):
+        create_document(result, {"componentDiagram": None})
+    with pytest.raises(ValueError, match="has no rendered PNG"):
+        create_business_document(result, {"componentDiagram": None})
+
+
+def test_business_document_uses_stakeholder_format_without_inventing_context(tmp_path):
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "orders.py", b"def order_status(): pass",
+    )
+    result = sample_result("Orders", input_context(), artifacts, with_diagram=True)
+    document = Document(io.BytesIO(create_business_document(
+        result, {"componentDiagram": TEST_PNG},
+    )))
+    text = "\n".join(
+        [paragraph.text for paragraph in document.paragraphs]
+        + [
+            cell.text for table in document.tables
+            for row in table.rows for cell in row.cells
+        ]
+    )
+
+    for section in (
+        "Functional Requirements Specification (FRS)",
+        "Document Use and Audience",
+        "1. Executive Summary",
+        "2. Business Problem and Objectives",
+        "2.1 Business Objectives",
+        "3. Scope",
+        "3.1 Current State and Future State",
+        "4. Business Capabilities, Processes, Modules, and Interfaces",
+        "4.1 Business Process Overview",
+        "4.2 Modules, Components, and Interfaces",
+        "4.3 UML Process and System Diagrams",
+        "5. Business Rules and Policy Considerations",
+        "6. Audience, Stakeholders, and Responsibilities",
+        "7. Benefits and Risks",
+        "7.1 Business Risks and Controls",
+        "8. Success Measures",
+        "9. Acceptance Criteria",
+        "10. Dependencies and Open Decisions",
+        "11. Requirements Matrix and Details",
+        "11.1 Requirements Matrix",
+        "11.2 Detailed Requirements",
+        "12. Evidence Classification and Traceability",
+        "Appendix A: Analysis Coverage",
+        "13. Review and Approval",
+        "Synthetic order-status component",
+    ):
+        assert section in text
+    assert "Implementation-derived; not approved business intent" in text
+    assert "The system will display order status." in text
+    assert "No Jira user stories or raw business requirements were supplied" in text
+    assert "orders.py" not in text
+
+
+def test_missing_model_uml_gets_source_component_map_in_both_reports(tmp_path, monkeypatch):
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "src/orders.py", b"def order_status(): pass",
+    )
+    result = sample_result("Orders", input_context(), artifacts)
+    result.analysisScope.analyzedCodeFiles = 1
+
+    assert ensure_source_component_diagram(result)
+    diagram = result.umlDiagrams.componentDiagram
+    assert diagram.generated
+    assert "src/orders.py" in diagram.mermaid
+    assert "analysis covered 1 eligible code file" in diagram.description
+    assert diagram.sourceEvidence[0].filePath == "src/orders.py"
+    assert any("source component diagram" in warning for warning in result.warnings)
+    monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
     rendered = render_generated_diagrams(result)
-    assert rendered["componentDiagram"] is None
-    assert any("structured text version" in warning for warning in result.warnings)
 
-    technical = Document(io.BytesIO(create_document(result, rendered)))
-    business = Document(io.BytesIO(create_business_document(result, rendered)))
-    technical_text = "\n".join(
-        [paragraph.text for paragraph in technical.paragraphs]
-        + [cell.text for table in technical.tables for row in table.rows for cell in row.cells]
-    )
-    business_text = "\n".join(
-        [paragraph.text for paragraph in business.paragraphs]
-        + [cell.text for table in business.tables for row in table.rows for cell in row.cells]
-    )
-    assert "Mermaid source:" in technical_text
-    assert "Orders component" in technical_text
-    assert "From / element" in business_text
-    assert "Orders component" in business_text
+    documents = [
+        Document(io.BytesIO(create_document(result, rendered))),
+        Document(io.BytesIO(create_business_document(result, rendered))),
+    ]
+    texts = [
+        "\n".join(
+            [paragraph.text for paragraph in document.paragraphs]
+            + [
+                cell.text for table in document.tables
+                for row in table.rows for cell in row.cells
+            ]
+        )
+        for document in documents
+    ]
+    assert all("Source Component Diagram" in text for text in texts)
+    assert "src/orders.py" in texts[0]
+    assert "src/orders.py" not in texts[1]
 
 
-def test_analysis_publishes_both_documents_without_mermaid_renderer(tmp_path, monkeypatch):
+def test_code_analysis_is_rejected_without_mermaid_renderer(tmp_path, monkeypatch):
     app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
     monkeypatch.setattr("tip.documents.shutil.which", lambda _: None)
-
-    class TestGateway:
-        def analyze(self, target, context, artifacts, coverage=None):
-            return sample_result(target, context, artifacts, with_diagram=True, coverage=coverage)
-
-    app.state.manager.gateway = TestGateway()
     with TestClient(app) as client:
+        configuration = client.get("/api/v1/configuration").json()
+        assert configuration["diagram_renderer_configured"] is False
+        assert "Node.js" in configuration["diagram_renderer_issue"]
         response = client.post(
             "/api/v1/analysis",
             data={"options": '{"target_application":"Orders"}'},
             files={"code_files": ("orders.py", b"def order_status(): pass", "text/plain")},
         )
-        task = wait_task(client, response.json()["task_id"])
-        assert task["status"] == "success", task.get("error")
-        assert any(
-            "structured text version" in warning
-            for warning in task["result"]["analysis"]["warnings"]
-        )
-        for endpoint in ("document", "business-document"):
-            document = client.get(f"/api/v1/tasks/{task['task_id']}/{endpoint}")
-            assert document.status_code == 200
-            assert zipfile.is_zipfile(io.BytesIO(document.content))
+        assert response.status_code == 503
+        assert "requires embedded UML images" in response.json()["detail"]
+        assert "Node.js" in response.json()["detail"]
+        assert client.get("/api/v1/tasks").json()["total_count"] == 0
 
 
 def test_mermaid_rendering_and_word_embedding(tmp_path):
@@ -574,20 +861,193 @@ def test_mermaid_rendering_and_word_embedding(tmp_path):
     validate_result(result, artifacts, input_context(), "Orders")
     assert not result.umlDiagrams.classDiagram.generated
     assert INVALID_DIAGRAM_WARNING in result.warnings
-    assert render_diagram(result.umlDiagrams.componentDiagram).startswith(b"\x89PNG")
-    data = create_document(result)
+    rendered = render_generated_diagrams(result)
+    assert rendered["componentDiagram"].startswith(b"\x89PNG")
+    data = create_document(result, rendered)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        assert any(name.startswith("word/media/") for name in archive.namelist())
+        assert any(
+            name.startswith("word/media/") and name.endswith(".png")
+            for name in archive.namelist()
+        )
         xml = archive.read("word/document.xml").decode()
         assert "flowchart LR" not in xml
+        assert "<w:drawing>" in xml
+        assert "Graphical rendering is unavailable" not in xml
         assert "Draft for Human Validation" in xml
-    business_data = create_business_document(result)
+    business_data = create_business_document(result, rendered)
     with zipfile.ZipFile(io.BytesIO(business_data)) as archive:
-        assert any(name.startswith("word/media/") for name in archive.namelist())
+        assert any(
+            name.startswith("word/media/") and name.endswith(".png")
+            for name in archive.namelist()
+        )
         xml = archive.read("word/document.xml").decode()
-        assert "Business Requirements" in xml
+        assert "Functional Requirements Specification (FRS)" in xml
+        assert "<w:drawing>" in xml
+        assert "Graphical rendering is unavailable" not in xml
         assert "How to read it" in xml
 
+def test_labeled_class_diagram_renders_without_native_resvg_panic(
+    tmp_path,
+    monkeypatch,
+):
+    if not mermaid_renderer_configured():
+        pytest.skip(
+            "Install Node.js and run npm install in frontend "
+            "to exercise Mermaid rendering"
+        )
+
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "glreport.py",
+        b"class GLReportService: pass\nclass ReportBuilder: pass",
+    )
+
+    result = sample_result(
+        "GL Report Generation",
+        input_context(),
+        artifacts,
+    )
+
+    source = (
+        "classDiagram\n"
+        "class GLReportService {\n"
+        "  +generate(report: dict): bytes\n"
+        "}\n"
+        "class ReportBuilder\n"
+        "GLReportService --> ReportBuilder : creates"
+    )
+
+    result.umlDiagrams.classDiagram = (
+        result.umlDiagrams.classDiagram.model_copy(
+            update={
+                "generated": True,
+                "title": "Class Diagram - GL Report Generation (glreport package)",
+                "description": "Test class diagram with a labeled relationship.",
+                "mermaid": source,
+                "sourceEvidence": (
+                    result.highLevelRequirements[0].sourceEvidence
+                ),
+                "reason": "",
+            }
+        )
+    )
+
+    rendered_sources = []
+    actual_render_diagram = render_diagram
+
+    def capture_render_source(diagram):
+        rendered_sources.append(diagram.mermaid)
+        return actual_render_diagram(diagram)
+
+    monkeypatch.setattr(
+        "tip.documents.render_diagram",
+        capture_render_source,
+    )
+
+    rendered = render_generated_diagrams(result)
+
+    assert rendered["classDiagram"].startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+
+    assert "GLReportService --> ReportBuilder" in rendered_sources[0]
+    assert ": creates" not in rendered_sources[0]
+    assert "+generate(report: dict): bytes" not in rendered_sources[0]
+    assert "class GLReportService" in rendered_sources[0]
+
+    assert result.umlDiagrams.classDiagram.mermaid == source
+
+    assert any(
+        "Class member details and relationship captions were omitted"
+        in item
+        for item in result.warnings
+    )
+
+    assert zipfile.is_zipfile(
+        io.BytesIO(create_document(result, rendered))
+    )
+
+    assert zipfile.is_zipfile(
+        io.BytesIO(create_business_document(result, rendered))
+    )
+
+
+def test_component_diagram_retries_with_safe_mermaid_source(
+    tmp_path,
+    monkeypatch,
+):
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "server.py",
+        b"def delegate_to_rag(): pass\n",
+    )
+
+    result = sample_result(
+        "Local RAG Server",
+        input_context(),
+        artifacts,
+    )
+
+    source = (
+        "flowchart LR\n"
+        '  ENTRY["Local RAG Server<br/>Entrypoint"]\n'
+        '  SERVICE["Delegation <b>Service</b>"]\n'
+        "  ENTRY -->|delegates incoming request| SERVICE\n"
+    )
+
+    diagram = result.umlDiagrams.componentDiagram.model_copy(
+        update={
+            "generated": True,
+            "title": (
+                "Component View - "
+                "Local RAG Server Entrypoint Delegation"
+            ),
+            "description": "Local RAG delegation flow.",
+            "mermaid": source,
+            "sourceEvidence": (
+                result.highLevelRequirements[0].sourceEvidence
+            ),
+            "reason": "",
+        }
+    )
+
+    result.umlDiagrams.componentDiagram = diagram
+
+    attempts = []
+
+    def fake_render(candidate):
+        attempts.append(candidate.mermaid)
+
+        if len(attempts) == 1:
+            raise ValueError(
+                "Local Mermaid rendering failed: "
+                "thread '<unnamed>' panicked at "
+                "resvg/src/geom.rs:27:61; "
+                "called `Option::unwrap()` on a `None` value"
+            )
+
+        return b"\x89PNG\r\n\x1a\nsafe-render"
+
+    monkeypatch.setattr(
+        "tip.documents.render_diagram",
+        fake_render,
+    )
+
+    rendered = render_generated_diagrams(result)
+
+    assert rendered["componentDiagram"].startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+
+    assert len(attempts) == 2
+
+    # First attempt contains the original Mermaid.
+    assert "<br/>" in attempts[0]
+    assert "<b>" in attempts[0]
+    assert "|delegates incoming request|" in attempts[0]
+
+    # Retry uses the renderer-safe Mermaid source.
+    assert "<br/>" not in attempts[1]
+    assert "<b>" not in attempts[1]
+    assert "|delegates incoming request|" not in attempts[1]
 
 def test_jira_integration_extracts_adf_and_custom_acceptance(tmp_path, monkeypatch):
     config = settings(
@@ -699,8 +1159,11 @@ def test_repository_subdirectory_uses_blobless_sparse_checkout(tmp_path, monkeyp
     )
 
 
-def test_full_analysis_upload_poll_download_and_reload(tmp_path):
+def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
     app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+    monkeypatch.setattr("tip.app.mermaid_renderer_configured", lambda: True)
+    monkeypatch.setattr("tip.app.mermaid_renderer_issue", lambda: None)
+    monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
     seen = []
 
     class TestGateway:
@@ -712,7 +1175,17 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path):
         configuration = client.get("/api/v1/configuration").json()
         assert configuration["persistence_backend"] == "SQLite"
         assert configuration["persistence_configured"] is True
-        assert configuration["repository_clone_timeout_seconds"] == 600
+        assert configuration["max_upload_bytes"] == 5_000_000_000
+        assert configuration["max_extracted_bytes"] == 10_000_000_000
+        assert configuration["max_archive_files"] == 50_000
+        assert configuration["max_archive_entries"] == 100_000
+        assert configuration["max_repository_files"] == 1_000_000
+        assert configuration["max_repository_bytes"] == 10_000_000_000
+        assert configuration["max_repository_file_bytes"] == 100_000_000
+        assert configuration["repository_clone_timeout_seconds"] == 1800
+        assert configuration["analysis_batch_concurrency"] == 2
+        assert configuration["diagram_renderer_configured"] is True
+        assert configuration["diagram_renderer_issue"] is None
         assert "neo4j_configured" not in configuration
         options = {
             "target_application": "Orders", "manual_stories": [{
@@ -751,13 +1224,32 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path):
         }
         analysis = client.get(f"/api/v1/tasks/{task_id}/analysis")
         assert analysis.status_code == 200
-        assert analysis.json()["warnings"]
+        analysis_result = analysis.json()
+        assert analysis_result["umlDiagrams"]["componentDiagram"]["generated"]
+        assert any("source component diagram" in warning for warning in analysis_result["warnings"])
         assert "attachment" in analysis.headers["content-disposition"]
         assert f"TIP-analysis-{task_id}.json" in analysis.headers["content-disposition"]
         document = client.get(f"/api/v1/tasks/{task_id}/document")
         assert document.status_code == 200
         assert zipfile.is_zipfile(io.BytesIO(document.content))
         assert "attachment" in document.headers["content-disposition"]
+        business_document = client.get(
+            f"/api/v1/tasks/{task_id}/business-document",
+        )
+        assert business_document.status_code == 200
+        for content, includes_source_paths in (
+            (document.content, True), (business_document.content, False),
+        ):
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                report_xml = archive.read("word/document.xml").decode()
+                assert any(
+                    name.startswith("word/media/") and name.endswith(".png")
+                    for name in archive.namelist()
+                )
+                assert "<w:drawing>" in report_xml
+            assert "Source Component Diagram" in report_xml
+            assert "Graphical rendering is unavailable" not in report_xml
+            assert ("orders.py" in report_xml) is includes_source_paths
         indexed_repo = task["result"]["repo_id"]
         related = client.get("/api/v1/graph/related",
                              params={"repoId": indexed_repo, "query": "order_status"})
@@ -766,7 +1258,7 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path):
         assert context.json()["budget_used"] <= 100
         impact = client.get("/api/v1/graph/impact", params={"repoId": indexed_repo, "file": "orders.py"})
         assert impact.status_code == 200
-        assert impact.json()["backend"] == "kuzu"
+        assert impact.json()["backend"] == "sqlite"        
         assert impact.json()["nodes"] == []
         assert client.get("/api/v1/metrics").status_code == 200
     new_app = create_app(settings(tmp_path))
@@ -775,84 +1267,171 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path):
         assert client.get("/api/v1/tasks").json()["total_count"] == 1
 
 
+def test_browser_upload_limit_is_enforced_without_queuing(tmp_path):
+    app = create_app(settings(
+        tmp_path, max_upload_bytes=3,
+        gateway_url="https://synthetic.example/completions",
+    ))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": json.dumps({"target_application": "Orders"})},
+            files={"code_files": ("orders.py", b"four", "text/plain")},
+        )
+
+        assert response.status_code == 413
+        assert "configured size limit" in response.json()["detail"]
+        assert client.get("/api/v1/tasks").json()["total_count"] == 0
+
 def test_large_repository_analysis_batches_every_eligible_file(tmp_path):
     source_root = tmp_path / "allowed"
     repository = source_root / "orders"
     repository.mkdir(parents=True)
+
     (repository / "orders.py").write_text(
-        "def order_status(): return 'ready'\n", encoding="utf-8",
+        "def order_status(): return 'ready'\n",
+        encoding="utf-8",
     )
     (repository / "payments.py").write_text(
-        "def authorize_payment(): return True\n", encoding="utf-8",
+        "def authorize_payment(): return True\n",
+        encoding="utf-8",
     )
     (repository / "inventory.py").write_text(
-        "def item_count(): return 1\n", encoding="utf-8",
+        "def item_count(): return 1\n",
+        encoding="utf-8",
     )
-    app = create_app(Settings(
-        _env_file=None, data_dir=tmp_path / "data",
-        local_source_root=source_root, graph_backend="sqlite",
-        gateway_url="https://synthetic.example/completions",
-        max_analysis_files=1, analysis_batch_files=1,
-    ))
-    seen = {"paths": [], "coverage": []}
+
+    app = create_app(
+        Settings(
+            _env_file=None,
+            data_dir=tmp_path / "data",
+            local_source_root=source_root,
+            graph_backend="sqlite",
+            gateway_url="https://synthetic.example/completions",
+            max_analysis_files=1,
+            analysis_batch_files=1,
+        )
+    )
+
+    seen = {
+        "paths": [],
+        "coverage": [],
+        "content_lengths": [],
+    }
 
     class CoverageGateway:
         def analyze(self, target, context, artifacts, coverage=None):
+            code_artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact.sourceType == "CODE"
+            ]
+
             seen["paths"].extend(
-                artifact.filePath for artifact in artifacts if artifact.sourceType == "CODE"
+                artifact.filePath
+                for artifact in code_artifacts
             )
+
+            seen["content_lengths"].extend(
+                len(artifact.content)
+                for artifact in code_artifacts
+            )
+
             seen["coverage"].append(coverage)
-            return sample_result(target, context, artifacts)
+
+            return sample_result(
+                target,
+                context,
+                artifacts,
+            )
 
     app.state.manager.gateway = CoverageGateway()
+
     with TestClient(app) as client:
-        response = client.post("/api/v1/analysis", data={"options": json.dumps({
-            "target_application": "Orders", "code_source": "local",
-            "local_path": str(repository), "focus": "order status",
-        })})
+        response = client.post(
+            "/api/v1/analysis",
+            data={
+                "options": json.dumps(
+                    {
+                        "target_application": "Orders",
+                        "code_source": "local",
+                        "local_path": str(repository),
+                        "focus": "order status",
+                    }
+                )
+            },
+        )
+
         assert response.status_code == 202, response.text
-        task = wait_task(client, response.json()["task_id"])
+
+        task = wait_task(
+            client,
+            response.json()["task_id"],
+        )
+
         assert task["status"] == "success", task.get("error")
-        assert seen["paths"] == ["inventory.py", "orders.py", "payments.py"]
-        assert seen["coverage"] == [{
-            "indexedCodeFiles": 3,
-            "retrievedCodeFiles": 1,
-            "retrievedCharacters": len("def item_count(): return 1\n"),
-            "selectionMethod": "all-file bounded batch analysis",
-            "batchRequestNumber": 1,
-        }, {
-            "indexedCodeFiles": 3,
-            "retrievedCodeFiles": 1,
-            "retrievedCharacters": len("def order_status(): return 'ready'\n"),
-            "selectionMethod": "all-file bounded batch analysis",
-            "batchRequestNumber": 2,
-        }, {
-            "indexedCodeFiles": 3,
-            "retrievedCodeFiles": 1,
-            "retrievedCharacters": len("def authorize_payment(): return True\n"),
-            "selectionMethod": "all-file bounded batch analysis",
-            "batchRequestNumber": 3,
-        }]
+
+        assert sorted(seen["paths"]) == [
+            "inventory.py",
+            "orders.py",
+            "payments.py",
+        ]
+
+        actual_coverage = sorted(
+            (
+                item["indexedCodeFiles"],
+                item["retrievedCodeFiles"],
+                item["retrievedCharacters"],
+            )
+            for item in seen["coverage"]
+        )
+
+        expected_coverage = sorted(
+            (
+                3,
+                1,
+                content_length,
+            )
+            for content_length in seen["content_lengths"]
+        )
+
+        assert actual_coverage == expected_coverage
+
+        assert sorted(
+            item["batchRequestNumber"]
+            for item in seen["coverage"]
+        ) == [1, 2, 3]
+
         assert task["result"]["files_indexed"] == 3
         assert task["result"]["files_analyzed"] == 3
+
         assert task["result"]["repository_coverage"] == {
             "indexedCodeFiles": 3,
             "retrievedCodeFiles": 3,
-            "retrievedCharacters": sum(map(len, [
-                "def item_count(): return 1\n",
-                "def order_status(): return 'ready'\n",
-                "def authorize_payment(): return True\n",
-            ])),
-            "selectionMethod": "all-file bounded batch analysis",
+            "retrievedCharacters": sum(
+                seen["content_lengths"]
+            ),
+            "selectionMethod": (
+                "all-file bounded batch analysis"
+            ),
             "analysisBatchCount": 3,
         }
-        assert len(task["result"]["analysis"]["codebaseInventory"]) == 3
-        assert task["result"]["analysis"]["analysisScope"]["analyzedCodeFiles"] == 3
+
+        assert len(
+            task["result"]["analysis"]["codebaseInventory"]
+        ) == 3
+
+        assert (
+            task["result"]["analysis"][
+                "analysisScope"
+            ]["analyzedCodeFiles"]
+            == 3
+        )
+
         assert not any(
             "remaining files were not analyzed" in warning
             for warning in task["result"]["analysis"]["warnings"]
         )
-
 
 def test_uploaded_zip_batches_every_readable_member(tmp_path):
     app = create_app(Settings(
@@ -919,7 +1498,7 @@ def test_large_artifact_is_split_with_original_line_numbers(tmp_path):
         assert response.status_code == 202
         task = wait_task(client, response.json()["task_id"])
         assert task["status"] == "success", task.get("error")
-        assert offsets == [0, 2]
+        assert sorted(offsets) == [0, 2]
         assert task["result"]["files_analyzed"] == 1
         assert task["result"]["repository_coverage"]["analysisBatchCount"] == 2
         evidence = task["result"]["analysis"]["highLevelRequirements"][0]["sourceEvidence"]
@@ -956,7 +1535,15 @@ def test_gateway_504_splits_batches_and_merges_all_results(tmp_path):
         assert response.status_code == 202, response.text
         task = wait_task(client, response.json()["task_id"])
         assert task["status"] == "success", task.get("error")
-        assert [len(call) for call in calls] == [4, 2, 1, 1, 2, 1, 1]
+        assert sorted(map(tuple, calls)) == sorted((
+            ("src/accounts.py", "src/orders.py", "src/payments.py", "src/users.py"),
+            ("src/accounts.py", "src/orders.py"),
+            ("src/payments.py", "src/users.py"),
+            ("src/accounts.py",),
+            ("src/orders.py",),
+            ("src/payments.py",),
+            ("src/users.py",),
+        ))
         assert task["result"]["files_analyzed"] == 4
         assert task["result"]["repository_coverage"]["analysisBatchCount"] == 4
         analysis = task["result"]["analysis"]
@@ -969,16 +1556,32 @@ def test_gateway_504_splits_a_single_large_file_content_chunk(tmp_path):
         _env_file=None, data_dir=tmp_path, graph_backend="sqlite",
         gateway_url="https://synthetic.example/completions",
         analysis_batch_characters=5_000,
+        analysis_batch_concurrency=2,
     ))
     seen_lengths = []
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+    two_calls_started = threading.Event()
 
     class ChunkSplitGateway:
         def analyze(self, target, context, artifacts, coverage=None):
+            nonlocal active, max_active
             artifact = next(item for item in artifacts if item.sourceType == "CODE")
             seen_lengths.append(len(artifact.content))
             if len(artifact.content) > 1_500:
                 raise GatewayError("AI gateway returned HTTP 504", status_code=504)
-            return sample_result(target, context, artifacts)
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    two_calls_started.set()
+            try:
+                assert two_calls_started.wait(timeout=3), "split batches did not run in parallel"
+                return sample_result(target, context, artifacts)
+            finally:
+                with active_lock:
+                    active -= 1
 
     app.state.manager.gateway = ChunkSplitGateway()
     with TestClient(app) as client:
@@ -991,6 +1594,7 @@ def test_gateway_504_splits_a_single_large_file_content_chunk(tmp_path):
         task = wait_task(client, response.json()["task_id"])
         assert task["status"] == "success", task.get("error")
         assert seen_lengths == [3_000, 1_500, 1_500]
+        assert max_active == 2
         assert task["result"]["files_analyzed"] == 1
         assert task["result"]["repository_coverage"]["analysisBatchCount"] == 2
 
@@ -1030,6 +1634,106 @@ def test_smallest_batch_504_retries_until_gateway_recovers(tmp_path):
             assert db.execute(
                 "SELECT count(*) FROM analysis_records WHERE task_id=?", (task_id,)
             ).fetchone()[0] == 1
+
+
+def test_single_batch_429_fails_fast_and_reduces_parallelism(tmp_path):
+    app = create_app(settings(
+        tmp_path, gateway_url="https://gateway.example/completions",
+        analysis_batch_concurrency=8,
+    ))
+    calls = 0
+
+    class RateLimitedGateway:
+        def analyze(self, target, context, artifacts, coverage=None):
+            nonlocal calls
+            calls += 1
+            raise GatewayError(
+                "AI gateway returned HTTP 429",
+                status_code=429,
+                retry_after=0.01,
+            )
+
+    app.state.manager.gateway = RateLimitedGateway()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": '{"target_application":"Orders"}'},
+            files={"code_files": ("orders.py", b"def order_status(): pass", "text/plain")},
+        )
+        task = wait_task(client, response.json()["task_id"])
+        assert task["status"] == "failed"
+        assert "HTTP 429" in task["error"]
+        assert "not the number of uploaded files" in task["error"]
+        assert "instead of retrying automatically" in task["error"]
+        assert "0.01 seconds" in task["error"]
+        assert calls == 1
+        assert app.state.manager.gateway_slots.limit == 1
+
+
+def test_gateway_exhausted_quota_fails_without_retrying(tmp_path):
+    app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+    calls = 0
+
+    class QuotaGateway:
+        def analyze(self, target, context, artifacts, coverage=None):
+            nonlocal calls
+            calls += 1
+            raise GatewayError(
+                "AI gateway returned HTTP 429",
+                status_code=429,
+                error_code="insufficient_quota",
+            )
+
+    app.state.manager.gateway = QuotaGateway()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": '{"target_application":"Orders"}'},
+            files={"code_files": ("orders.py", b"def order_status(): pass", "text/plain")},
+        )
+        task = wait_task(client, response.json()["task_id"])
+        assert task["status"] == "failed"
+        assert "exhausted model quota" in task["error"]
+        assert "reducing parallelism cannot resolve it" in task["error"]
+        assert calls == 1
+
+
+def test_generic_rate_limit_includes_error_code_without_retrying(tmp_path):
+    app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+    calls = 0
+
+    class InstantLimiter:
+        limit = 1
+
+        def acquire(self, check):
+            check()
+
+        def release(self, *, success, retry_after=None):
+            return None
+
+    class RateLimitedGateway:
+        def analyze(self, target, context, artifacts, coverage=None):
+            nonlocal calls
+            calls += 1
+            raise GatewayError(
+                "AI gateway returned HTTP 429",
+                status_code=429,
+                error_code="rate_limit_exceeded",
+            )
+
+    app.state.manager.gateway_slots = InstantLimiter()
+    app.state.manager.gateway = RateLimitedGateway()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": '{"target_application":"Orders"}'},
+            files={"code_files": ("orders.py", b"def order_status(): pass", "text/plain")},
+        )
+        task = wait_task(client, response.json()["task_id"])
+        assert task["status"] == "failed"
+        assert "HTTP 429 (rate_limit_exceeded)" in task["error"]
+        assert "request/token rate limit" in task["error"]
+        assert calls == 1
 
 
 def test_smallest_batch_504_retry_can_be_cancelled(tmp_path):

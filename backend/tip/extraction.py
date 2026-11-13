@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from typing import BinaryIO, Iterator
 from urllib.parse import urlsplit
 
 import httpx
@@ -60,11 +60,11 @@ def excluded(name: str) -> bool:
     )
 
 
-def checked_zip(data: bytes, settings: Settings) -> zipfile.ZipFile:
-    archive = zipfile.ZipFile(io.BytesIO(data))
+def checked_zip(data: bytes | BinaryIO, settings: Settings) -> zipfile.ZipFile:
+    archive = zipfile.ZipFile(io.BytesIO(data) if isinstance(data, bytes) else data)
     try:
         members = archive.infolist()
-        if len(members) > settings.max_files * 20:
+        if len(members) > settings.max_archive_entries:
             raise ValueError("Archive contains too many entries")
         total = 0
         for item in members:
@@ -87,9 +87,13 @@ def check_office(data: bytes, settings: Settings):
     with checked_zip(data, settings) as archive:
         for item in archive.infolist():
             if item.filename.lower().endswith(".xml"):
-                content = archive.read(item)
-                if b"<!DOCTYPE" in content.upper() or b"<!ENTITY" in content.upper():
-                    raise ValueError("XML entities and DTDs are not allowed in Office files")
+                with archive.open(item) as source:
+                    overlap = b""
+                    while chunk := source.read(64 * 1024):
+                        content = overlap + chunk.upper()
+                        if b"<!DOCTYPE" in content or b"<!ENTITY" in content:
+                            raise ValueError("XML entities and DTDs are not allowed in Office files")
+                        overlap = content[-16:]
 
 
 class Extractor:
@@ -103,6 +107,7 @@ class Extractor:
         self.unsupported_count = 0
         self.seen: set[tuple[str, str, str | None, int | None]] = set()
         self.file_count = 0
+        self.file_counts: dict[str, int] = {}
         self.expanded_bytes = 0
 
     @staticmethod
@@ -124,11 +129,20 @@ class Extractor:
 
     def _count_source(
         self, byte_count: int, file_limit: int | None, byte_limit: int | None,
+        *, group: str = "upload",
     ):
         self.file_count += 1
-        self.expanded_bytes += byte_count
-        if self.file_count > (file_limit or self.settings.max_files):
+        self.file_counts[group] = self.file_counts.get(group, 0) + 1
+        default_file_limit = {
+            "archive": self.settings.max_archive_files,
+            "repository": self.settings.max_repository_files,
+        }.get(group, self.settings.max_files)
+        if self.file_counts[group] > (file_limit or default_file_limit):
             raise ValueError("Too many source files")
+        self._count_bytes(byte_count, byte_limit)
+
+    def _count_bytes(self, byte_count: int, byte_limit: int | None):
+        self.expanded_bytes += byte_count
         if self.expanded_bytes > (byte_limit or self.settings.max_extracted_bytes):
             raise ValueError("Combined expanded artifacts exceed the size limit")
 
@@ -152,15 +166,36 @@ class Extractor:
         self, name: str, data: bytes, kind: SourceType = "CODE",
         *, file_limit: int | None = None, byte_limit: int | None = None,
     ) -> list[Artifact]:
+        return list(self.iter_file(
+            name, io.BytesIO(data), kind,
+            file_size=len(data), file_limit=file_limit, byte_limit=byte_limit,
+        ))
+
+    def iter_file(
+        self, name: str, source: BinaryIO, kind: SourceType = "CODE", *,
+        file_size: int | None = None, file_limit: int | None = None,
+        byte_limit: int | None = None,
+    ) -> Iterator[Artifact]:
         name = safe_path(name)
-        self._count_source(len(data), file_limit, byte_limit)
+        if file_size is None:
+            source.seek(0, os.SEEK_END)
+            file_size = source.tell()
+        source.seek(0)
+        suffix = PurePosixPath(name).suffix.lower()
+        is_code_archive = suffix == ".zip" and kind == "CODE"
+        effective_file_limit = file_limit or (
+            self.settings.max_archive_files if is_code_archive
+            else self.settings.max_files
+        )
+        if is_code_archive:
+            self._count_bytes(file_size, byte_limit)
+        else:
+            self._count_source(file_size, effective_file_limit, byte_limit)
         if kind == "CODE" and excluded(name):
             self._exclude(name)
-            return []
-        suffix = PurePosixPath(name).suffix.lower()
-        if suffix == ".zip" and kind == "CODE":
-            result = []
-            with checked_zip(data, self.settings) as archive:
+            return
+        if is_code_archive:
+            with checked_zip(source, self.settings) as archive:
                 for member in archive.infolist():
                     if member.is_dir():
                         continue
@@ -170,49 +205,120 @@ class Extractor:
                         continue
                     if PurePosixPath(member_name).suffix.lower() in {".zip", ".tar", ".gz", ".7z"}:
                         raise ValueError("Nested archives are not supported; upload one source ZIP")
-                    result.extend(self.extract(
-                        member_name, archive.read(member), kind,
-                        file_limit=file_limit, byte_limit=byte_limit,
-                    ))
-            return result
+                    self._count_source(
+                        member.file_size, effective_file_limit, byte_limit,
+                        group="archive",
+                    )
+                    if not self._readable_code_path(member_name):
+                        self._unsupported(member_name)
+                        continue
+                    if member.file_size > self.settings.max_artifact_characters * 4 + 4:
+                        self._unsupported(member_name)
+                        self._warn(
+                            f"File exceeds the per-artifact character limit and was omitted: {member_name}"
+                        )
+                        continue
+                    with archive.open(member) as content_stream:
+                        data = content_stream.read(
+                            self.settings.max_artifact_characters * 4 + 5
+                        )
+                    if len(data) > self.settings.max_artifact_characters * 4 + 4:
+                        self._unsupported(member_name)
+                        self._warn(
+                            f"File exceeds the per-artifact character limit and was omitted: {member_name}"
+                        )
+                        continue
+                    yield from self._extract_content(member_name, data, kind)
+            return
+
+        if kind == "CODE" and not self._readable_code_path(name):
+            self._unsupported(name)
+            return
+        read_limit = (
+            self.settings.max_artifact_characters * 4 + 4
+            if kind == "CODE" else self.settings.max_supporting_file_bytes
+        )
+        if file_size > read_limit:
+            if kind == "CODE":
+                self._unsupported(name)
+                self._warn(
+                    f"File exceeds the per-artifact character limit and was omitted: {name}"
+                )
+                return
+            raise ValueError(
+                f"{name} exceeds the per-supporting-file limit of "
+                f"{self.settings.max_supporting_file_bytes:,} bytes"
+            )
+        data = source.read(read_limit + 1)
+        if len(data) > read_limit:
+            if kind == "CODE":
+                self._unsupported(name)
+                self._warn(
+                    f"File exceeds the per-artifact character limit and was omitted: {name}"
+                )
+                return
+            raise ValueError(
+                f"{name} exceeds the per-supporting-file limit of "
+                f"{self.settings.max_supporting_file_bytes:,} bytes"
+            )
+        yield from self._extract_content(name, data, kind)
+
+    @staticmethod
+    def _readable_code_path(name: str) -> bool:
+        return PurePosixPath(name).suffix.lower() in TEXT_EXTENSIONS or (
+            PurePosixPath(name).name
+            in {"Dockerfile", "Makefile", "Jenkinsfile", "Procfile"}
+        )
+
+    def _extract_content(
+        self, name: str, data: bytes, kind: SourceType,
+    ) -> Iterator[Artifact]:
+        suffix = PurePosixPath(name).suffix.lower()
         if kind == "DESIGN_DOCUMENT" and suffix == ".docx":
             check_office(data, self.settings)
             document = Document(io.BytesIO(data))
             lines = [p.text for p in document.paragraphs if p.text.strip()]
             for table in document.tables:
                 lines.extend(" | ".join(cell.text for cell in row.cells) for row in table.rows)
-            return [self.artifact(kind, name, "\n".join(lines))]
+            yield self.artifact(kind, name, "\n".join(lines))
+            return
         if kind == "RAW_REQUIREMENT" and suffix in {".xlsx", ".xls"}:
-            return self.workbook(name, data, suffix)
+            yield from self.workbook(name, data, suffix)
+            return
         if kind == "JIRA_USER_STORY" and suffix == ".json":
             stories = json.loads(data)
             if not isinstance(stories, list) or not stories:
                 raise ValueError("Story JSON must contain a nonempty array of manual story objects")
             if len(stories) > 100:
                 raise ValueError("Story JSON is limited to 100 stories")
-            return [
-                self.story(ManualStory.model_validate(item), f"{name}#{index + 1}")
-                for index, item in enumerate(stories)
-            ]
+            for index, item in enumerate(stories):
+                yield self.story(ManualStory.model_validate(item), f"{name}#{index + 1}")
+            return
         if kind != "CODE" and suffix not in {".txt", ".md"}:
             raise ValueError(f"Unsupported {kind} file: {name}")
-        if kind == "CODE" and suffix not in TEXT_EXTENSIONS and PurePosixPath(name).name not in {
-            "Dockerfile", "Makefile", "Jenkinsfile", "Procfile",
-        }:
+        if kind == "CODE" and not self._readable_code_path(name):
             self._unsupported(name)
-            return []
+            return
         try:
             text = data.decode("utf-8-sig")
         except UnicodeDecodeError as error:
             raise ValueError(f"{name} is not readable UTF-8 text") from error
         if not text.strip():
             self._warn(f"Empty file omitted: {name}")
-            return []
+            return
         metadata = (
             {"filePath": name, "sha256": hashlib.sha256(data).hexdigest()}
             if kind == "CODE" else {}
         )
-        return [self.artifact(kind, name, text, **metadata)]
+        try:
+            yield self.artifact(kind, name, text, **metadata)
+        except ValueError as error:
+            if kind != "CODE" or "per-artifact character limit" not in str(error):
+                raise
+            self._unsupported(name)
+            self._warn(
+                f"File exceeds the per-artifact character limit and was omitted: {name}"
+            )
 
     def workbook(self, name: str, data: bytes, suffix: str) -> list[Artifact]:
         result = []
@@ -282,7 +388,10 @@ class Extractor:
                 source_path = (PurePosixPath(prefix) / relative).as_posix()
                 size = path.stat().st_size
                 if size > self.settings.max_repository_file_bytes:
-                    self._count_source(size, file_limit, byte_limit)
+                    self._count_source(
+                        size, file_limit or self.settings.max_repository_files,
+                        byte_limit, group="repository",
+                    )
                     self._unsupported(source_path)
                     self._warn(f"File exceeds the per-file size limit and was omitted: {source_path}")
                     continue

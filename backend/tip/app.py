@@ -2,6 +2,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import logging
@@ -16,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
 
 from .config import Settings
-from .documents import mermaid_renderer_configured
+from .documents import mermaid_renderer_configured, mermaid_renderer_issue
 from .extraction import Extractor, safe_path, source_directory
 from .gateway import Gateway, prompt_file_issue
 from .models import AnalysisOptions
@@ -124,6 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "rag_configured": bool(config.rag_base_url),
                 "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
                 "diagram_renderer_configured": mermaid_renderer_configured(),
+                "diagram_renderer_issue": mermaid_renderer_issue(),
             },
             "graph_backend": config.graph_backend,
             "retrieval_backend": "SQLite FTS5",
@@ -149,9 +151,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "embedding_provider": config.embedding_provider,
             "semantic_search": config.embedding_provider == "sentence_transformers",
             "diagram_renderer_configured": mermaid_renderer_configured(),
+            "diagram_renderer_issue": mermaid_renderer_issue(),
             "jira_configured": bool(config.jira_base_url and config.jira_token.get_secret_value()),
             "server_directories_enabled": config.local_source_root is not None,
             "max_upload_bytes": config.max_upload_bytes,
+            "max_extracted_bytes": config.max_extracted_bytes,
+            "max_supporting_file_bytes": config.max_supporting_file_bytes,
+            "max_archive_files": config.max_archive_files,
+            "max_archive_entries": config.max_archive_entries,
             "max_files": config.max_files,
             "max_artifact_characters": config.max_artifact_characters,
             "max_repository_files": config.max_repository_files,
@@ -162,6 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_analysis_characters": config.max_analysis_characters,
             "analysis_batch_files": config.analysis_batch_files,
             "analysis_batch_characters": config.analysis_batch_characters,
+            "analysis_batch_concurrency": config.analysis_batch_concurrency,
             "max_graph_index_files": config.max_graph_index_files,
             "max_graph_index_characters": config.max_graph_index_characters,
             "max_knowledge_index_files": config.max_knowledge_index_files,
@@ -173,9 +181,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def metrics():
         return Response(store.metrics(), media_type="text/plain")
 
-    def submit(metadata, operation):
+    def submit(metadata, operation, cleanup=None):
         try:
-            task = manager.submit(metadata, operation)
+            task = manager.submit(metadata, operation, cleanup)
         except ValueError as error:
             raise HTTPException(429, str(error)) from error
         return {"task_id": task["task_id"], "status": task["status"], "message": "Queued"}
@@ -194,7 +202,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         content_length = request.headers.get("content-length")
         if content_length:
             try:
-                if int(content_length) > config.max_upload_bytes + 1_000_000:
+                body_limit = config.max_upload_bytes + max(
+                    1_000_000, config.max_files * 4096 + 250_000,
+                )
+                if int(content_length) > body_limit:
                     raise HTTPException(413, "Combined upload exceeds the size limit")
             except ValueError as error:
                 raise HTTPException(400, "Invalid Content-Length") from error
@@ -202,46 +213,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "code_files": "CODE", "design_files": "DESIGN_DOCUMENT",
             "requirements_files": "RAW_REQUIREMENT", "story_files": "JIRA_USER_STORY",
         }
-        async with request.form(
-            max_files=config.max_files, max_fields=10, max_part_size=200_000
-        ) as form:
-            try:
-                options = AnalysisOptions.model_validate_json(str(form.get("options", "")))
-            except ValidationError as error:
-                raise HTTPException(422, [
-                    {"loc": list(e["loc"]), "msg": e["msg"]} for e in error.errors()
-                ]) from error
-            uploads = []
-            total = 0
-            for name, value in form.multi_items():
-                if name == "options":
-                    continue
-                if name not in kinds or not isinstance(value, UploadFile):
-                    raise HTTPException(422, f"Unknown upload field: {name}")
+        uploads: list[Upload] = []
+        submitted = False
+
+        def cleanup_uploads():
+            for upload in uploads:
+                upload.close()
+
+        try:
+            async with request.form(
+                max_files=config.max_files, max_fields=10, max_part_size=1_000_000
+            ) as form:
                 try:
-                    filename = safe_path(value.filename or "")
-                except ValueError as error:
-                    raise HTTPException(422, str(error)) from error
-                chunks = []
-                while chunk := await value.read(64 * 1024):
-                    total += len(chunk)
+                    options = AnalysisOptions.model_validate_json(str(form.get("options", "")))
+                except ValidationError as error:
+                    raise HTTPException(422, [
+                        {"loc": list(e["loc"]), "msg": e["msg"]} for e in error.errors()
+                    ]) from error
+                total = 0
+                for name, value in form.multi_items():
+                    if name == "options":
+                        continue
+                    if name not in kinds or not isinstance(value, UploadFile):
+                        raise HTTPException(422, f"Unknown upload field: {name}")
+                    try:
+                        filename = safe_path(value.filename or "")
+                    except ValueError as error:
+                        raise HTTPException(422, str(error)) from error
+                    file_size = value.size
+                    if file_size is None:
+                        value.file.seek(0, os.SEEK_END)
+                        file_size = value.file.tell()
+                    total += file_size
                     if total > config.max_upload_bytes:
-                        raise HTTPException(413, "Combined upload exceeds the size limit")
-                    chunks.append(chunk)
-                uploads.append(Upload(filename, b"".join(chunks), kinds[name]))
-        if not uploads and not options.manual_stories and not options.jira_issue_keys and options.code_source == "uploads":
-            raise HTTPException(422, "NO_ANALYZABLE_INPUT: provide code or supporting evidence")
-        return submit(
-            {"kind": "analysis", "target_application": options.target_application,
-             "mode": options.analysis_mode},
-            lambda task_id: manager.analyze(task_id, options, uploads),
-        )
+                        raise HTTPException(413, "Combined upload exceeds the configured size limit")
+                    value.file.rollover()
+                    value.file.seek(0)
+                    stream = os.fdopen(os.dup(value.file.fileno()), "rb")
+                    uploads.append(Upload(
+                        filename, b"", kinds[name], stream=stream, size=file_size,
+                    ))
+            if (
+                not uploads and not options.manual_stories and not options.jira_issue_keys
+                and options.code_source == "uploads"
+            ):
+                raise HTTPException(422, "NO_ANALYZABLE_INPUT: provide code or supporting evidence")
+            has_code_source = (
+                options.code_source != "uploads"
+                or any(upload.kind == "CODE" for upload in uploads)
+            )
+            if has_code_source:
+                renderer_issue = mermaid_renderer_issue()
+                if renderer_issue:
+                    raise HTTPException(
+                        503,
+                        "Code-based analysis requires embedded UML images. "
+                        f"{renderer_issue}",
+                    )
+            response = submit(
+                {"kind": "analysis", "target_application": options.target_application,
+                 "mode": options.analysis_mode},
+                lambda task_id: manager.analyze(task_id, options, uploads),
+                cleanup=cleanup_uploads,
+            )
+            submitted = True
+            return response
+        finally:
+            if not submitted:
+                cleanup_uploads()
 
     @app.get("/api/v1/tasks")
-    def tasks(status: str | None = None, limit: int = Query(default=100, ge=1, le=1000)):
+    def tasks(
+        status: str | None = None, limit: int = Query(default=100, ge=1, le=1000),
+        include_result: bool = True,
+    ):
         if status and status not in {"pending", "running", "success", "failed", "cancelled"}:
             raise HTTPException(422, "Unknown task status")
-        return store.list_tasks(status, limit)
+        return store.list_tasks(status, limit, include_result=include_result)
 
     def require_task(task_id: str):
         task = store.get(task_id)
@@ -252,8 +300,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/tasks/stats")
     def queue_stats():
         return {
-            "counts": {status: store.list_tasks(status, limit=1)["total_count"] for status in
-                       ("pending", "running", "success", "failed", "cancelled")},
+            "counts": {
+                status: store.list_tasks(
+                    status, limit=1, include_result=False,
+                )["total_count"]
+                for status in ("pending", "running", "success", "failed", "cancelled")
+            },
             "max_concurrent_tasks": config.max_concurrent_tasks,
         }
 
@@ -292,7 +344,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return StreamingResponse(
             io.BytesIO(document),
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="TIP-requirements-{task_id}.docx"'},
+            headers={"Content-Disposition": f'attachment; filename="TIP-technical-requirements-{task_id}.docx"'},
         )
 
     @app.get("/api/v1/tasks/{task_id}/business-document")
@@ -306,7 +358,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
                 "Content-Disposition":
-                    f'attachment; filename="TIP-business-requirements-{task_id}.docx"'
+                    f'attachment; filename="TIP-non-technical-FRS-{task_id}.docx"'
             },
         )
 

@@ -1,0 +1,251 @@
+let gatewayResponse = null;
+let result = null;
+
+pm.test("HTTP status is 200", function () {
+    pm.response.to.have.status(200);
+});
+
+if (pm.response.code !== 200) {
+    console.error("Gateway request failed:", pm.response.code, pm.response.text());
+} else {
+    try {
+        gatewayResponse = pm.response.json();
+    } catch (error) {
+        console.error("Gateway response is not valid JSON:", error);
+    }
+
+    pm.test("Gateway returned one completion", function () {
+        pm.expect(gatewayResponse).to.be.an("object");
+        pm.expect(gatewayResponse.choices).to.be.an("array").and.have.lengthOf(1);
+    });
+
+    const choice =
+        gatewayResponse &&
+        Array.isArray(gatewayResponse.choices) &&
+        gatewayResponse.choices.length === 1
+            ? gatewayResponse.choices[0]
+            : null;
+
+    pm.test("Model completed successfully", function () {
+        pm.expect(choice).to.be.an("object");
+        pm.expect(choice.finish_reason).to.eql("stop");
+    });
+
+    const content =
+        choice && choice.message
+            ? choice.message.content
+            : null;
+
+    pm.test("Assistant content exists", function () {
+        pm.expect(content).to.be.a("string").and.not.empty;
+    });
+
+    if (typeof content === "string") {
+        try {
+            result = JSON.parse(content);
+        } catch (error) {
+            console.error("Assistant content is not valid JSON:", error);
+        }
+    }
+
+    pm.test("Assistant returned a TIP analysis object", function () {
+        pm.expect(result).to.be.an("object");
+        pm.expect(result.status).to.eql("SUCCESS");
+        pm.expect(result.schemaVersion).to.eql("2.0");
+    });
+
+    if (result && result.status === "SUCCESS") {
+        pm.test("Analysis result has required sections", function () {
+            pm.expect(result.documentTitle).to.be.a("string").and.not.empty;
+            pm.expect(result.documentInformation).to.be.an("object");
+            pm.expect(result.inputContext).to.be.an("object");
+            pm.expect(result.analysisScope).to.be.an("object");
+            pm.expect(result.codebaseInventory).to.be.an("array");
+            pm.expect(result.supportingArtifactInventory).to.be.an("array");
+            pm.expect(result.applicationOverview).to.be.an("object");
+            pm.expect(result.highLevelRequirements).to.be.an("array");
+            pm.expect(result.nonFunctionalRequirements).to.be.an("array");
+            pm.expect(result.umlDiagrams).to.be.an("object");
+            pm.expect(result.requirementsToDesignTraceability).to.be.an("array");
+            pm.expect(result.validationStatement).to.be.a("string").and.not.empty;
+        });
+
+        function validateRequirements(name, requirements, prefix, extraField) {
+            if (!Array.isArray(requirements)) return;
+
+            requirements.forEach(function (item, index) {
+                pm.test(name + " " + (index + 1) + " is valid", function () {
+                    pm.expect(item.id).to.match(new RegExp("^" + prefix + "-\\d{3}$"));
+                    pm.expect(item.requirement).to.be.a("string").and.not.empty;
+                    pm.expect(item.acceptanceCriterion).to.be.a("string").and.not.empty;
+                    pm.expect(item[extraField]).to.be.a("string").and.not.empty;
+                    pm.expect(item.sourceEvidence).to.be.an("array").and.not.empty;
+                    pm.expect(item.requirementOrigin).to.be.an("array").and.not.empty;
+                    pm.expect(item.implementationEvidenceStatus).to.be.oneOf([
+                        "IMPLEMENTATION_EVIDENCED",
+                        "IMPLEMENTATION_PARTIALLY_EVIDENCED",
+                        "IMPLEMENTATION_NOT_EVIDENCED",
+                        "NOT_APPLICABLE"
+                    ]);
+                    pm.expect(item.evidenceStatus).to.be.oneOf([
+                        "VERIFIED",
+                        "PARTIALLY_EVIDENCED"
+                    ]);
+                });
+            });
+        }
+
+        validateRequirements(
+            "Functional requirement",
+            result.highLevelRequirements,
+            "HLR",
+            "capability"
+        );
+
+        validateRequirements(
+            "Non-functional requirement",
+            result.nonFunctionalRequirements,
+            "NFR",
+            "category"
+        );
+
+        function validateDiagram(name, diagram) {
+            pm.test(name + " has a valid structure", function () {
+                pm.expect(diagram).to.be.an("object");
+                pm.expect(diagram.generated).to.be.a("boolean");
+                pm.expect(diagram.title).to.be.a("string");
+                pm.expect(diagram.description).to.be.a("string");
+                pm.expect(diagram.mermaid).to.be.a("string");
+                pm.expect(diagram.sourceEvidence).to.be.an("array");
+                pm.expect(diagram.reason).to.be.a("string");
+            });
+
+            if (!diagram || typeof diagram !== "object") return;
+
+            if (diagram.generated === true) {
+                pm.test(name + " contains Mermaid source and evidence", function () {
+                    pm.expect(diagram.title).to.be.a("string").and.not.empty;
+                    pm.expect(diagram.mermaid).to.be.a("string").and.not.empty;
+                    pm.expect(diagram.sourceEvidence).to.be.an("array").and.not.empty;
+                    pm.expect(diagram.reason).to.eql("");
+                    pm.expect(diagram.mermaid).to.match(
+                        /^\s*(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram-v2|erDiagram)\b/m
+                    );
+                    pm.expect(diagram.mermaid).not.to.include("@startuml");
+                    pm.expect(diagram.mermaid).not.to.include("@enduml");
+                });
+            } else {
+                pm.test(name + " uses the required not-generated shape", function () {
+                    pm.expect(diagram.title).to.eql("");
+                    pm.expect(diagram.description).to.eql("");
+                    pm.expect(diagram.mermaid).to.eql("");
+                    pm.expect(diagram.sourceEvidence).to.eql([]);
+                    pm.expect(diagram.reason).to.eql(
+                        "Not evidenced in the supplied artifacts."
+                    );
+                });
+            }
+        }
+
+        function validateDiagramArray(name, diagrams) {
+            pm.test(name + " is an array", function () {
+                pm.expect(diagrams).to.be.an("array");
+            });
+
+            if (!Array.isArray(diagrams)) return;
+
+            diagrams.forEach(function (diagram, index) {
+                pm.test(name + " " + (index + 1) + " is generated", function () {
+                    pm.expect(diagram.generated).to.eql(true);
+                });
+                validateDiagram(name + " " + (index + 1), diagram);
+            });
+        }
+
+        const uml = result.umlDiagrams || {};
+
+        validateDiagram("Component diagram", uml.componentDiagram);
+        validateDiagram("Class diagram", uml.classDiagram);
+        validateDiagram("Package diagram", uml.packageDiagram);
+        validateDiagram("Deployment diagram", uml.deploymentDiagram);
+        validateDiagram("Use case diagram", uml.useCaseDiagram);
+
+        validateDiagramArray("Sequence diagrams", uml.sequenceDiagrams);
+        validateDiagramArray("Activity diagrams", uml.activityDiagrams);
+        validateDiagramArray("State machine diagrams", uml.stateMachineDiagrams);
+
+        const requirements = []
+            .concat(result.highLevelRequirements || [])
+            .concat(result.nonFunctionalRequirements || []);
+        const traceability = result.requirementsToDesignTraceability || [];
+
+        pm.test("Traceability covers each requirement exactly once", function () {
+            pm.expect(traceability).to.be.an("array");
+            pm.expect(traceability.length).to.eql(requirements.length);
+
+            const counts = {};
+            traceability.forEach(function (entry) {
+                counts[entry.requirementId] = (counts[entry.requirementId] || 0) + 1;
+            });
+
+            requirements.forEach(function (item) {
+                pm.expect(counts[item.id]).to.eql(1);
+            });
+        });
+
+        const generatedDiagrams = [];
+
+        function addGeneratedDiagram(type, diagram, index) {
+            if (diagram && diagram.generated === true) {
+                generatedDiagrams.push({
+                    type: type,
+                    index: index || null,
+                    title: diagram.title,
+                    description: diagram.description,
+                    mermaid: diagram.mermaid,
+                    sourceEvidence: diagram.sourceEvidence
+                });
+            }
+        }
+
+        addGeneratedDiagram("Component Diagram", uml.componentDiagram);
+        addGeneratedDiagram("Class Diagram", uml.classDiagram);
+        addGeneratedDiagram("Package Diagram", uml.packageDiagram);
+        addGeneratedDiagram("Deployment Diagram", uml.deploymentDiagram);
+        addGeneratedDiagram("Use Case Diagram", uml.useCaseDiagram);
+
+        [
+            ["Sequence Diagram", uml.sequenceDiagrams],
+            ["Activity Diagram", uml.activityDiagrams],
+            ["State Machine Diagram", uml.stateMachineDiagrams]
+        ].forEach(function (group) {
+            if (Array.isArray(group[1])) {
+                group[1].forEach(function (diagram, index) {
+                    addGeneratedDiagram(group[0], diagram, index + 1);
+                });
+            }
+        });
+
+        pm.collectionVariables.set("TIP_Result", JSON.stringify(result));
+        pm.collectionVariables.set(
+            "TIP_Requirements",
+            JSON.stringify(result.highLevelRequirements || [])
+        );
+        pm.collectionVariables.set(
+            "TIP_NFRs",
+            JSON.stringify(result.nonFunctionalRequirements || [])
+        );
+        pm.collectionVariables.set(
+            "TIP_Traceability",
+            JSON.stringify(traceability)
+        );
+        pm.collectionVariables.set(
+            "TIP_GeneratedDiagrams",
+            JSON.stringify(generatedDiagrams)
+        );
+
+        console.log("TIP analysis validated.");
+        console.log("Requirements:", requirements.length);
+        console.log("Generated Mermaid diagrams:", generatedDiagrams.length);
+    }
+}

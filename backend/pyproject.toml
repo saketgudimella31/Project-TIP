@@ -32,7 +32,7 @@ where = [".", "../src"]
 include = ["tip*", "codebase_rag*"]
 
 [tool.setuptools.package-data]
-tip = ["prompts/*.txt"]
+tip = ["prompts/*.txt", "render-mermaid.mjs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

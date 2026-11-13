@@ -77,7 +77,6 @@ pyproject.toml
 ../src/codebase_rag/services/utils/metrics.py
 ../src/codebase_rag/services/utils/ranker.py
 tests/test_batching.py
-tests/test_code_graph.py
 tests/test_rag_replacement.py
 tests/test_workflow.py
 tip/__init__.py
@@ -90,6 +89,7 @@ tip/gateway.py
 tip/models.py
 tip/neo4j_store.py
 tip/rag_routes.py
+tip/render-mermaid.mjs
 tip/service.py
 tip/storage.py
 tip/test_batching.py
