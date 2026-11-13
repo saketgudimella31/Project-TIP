@@ -103,10 +103,15 @@ export interface Configuration {
   embedding_provider?: 'hash' | 'sentence_transformers'
   semantic_search?: boolean
   diagram_renderer_configured?: boolean
+  diagram_renderer_issue?: string | null
   jira_configured: boolean
   server_directories_enabled: boolean
   max_upload_bytes: number
+  max_extracted_bytes?: number
+  max_supporting_file_bytes?: number
   max_files: number
+  max_archive_files?: number
+  max_archive_entries?: number
   max_artifact_characters: number
   max_repository_files: number
   max_repository_bytes: number
@@ -116,6 +121,7 @@ export interface Configuration {
   max_analysis_characters: number
   analysis_batch_files: number
   analysis_batch_characters: number
+  analysis_batch_concurrency: number
   max_graph_index_files?: number
   max_graph_index_characters?: number
   max_knowledge_index_files?: number
@@ -149,10 +155,12 @@ export const requirementsApi = {
         form.append(field, file, file.webkitRelativePath || file.name)
       }
     }
-    return requirementsClient.post<{ task_id: string }>('/analysis', form)
+    return requirementsClient.post<{ task_id: string }>('/analysis', form, { timeout: 0 })
   },
   task: (taskId: string) => requirementsClient.get<AnalysisTask>(`/tasks/${taskId}`),
-  tasks: () => requirementsClient.get<{ tasks: AnalysisTask[] }>('/tasks', { params: { limit: 100 } }),
+  tasks: () => requirementsClient.get<{ tasks: AnalysisTask[] }>('/tasks', {
+    params: { limit: 100, include_result: false },
+  }),
   cancel: (taskId: string) => requirementsClient.post(`/tasks/${taskId}/cancel`),
   documentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/document`,
   businessDocumentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/business-document`,

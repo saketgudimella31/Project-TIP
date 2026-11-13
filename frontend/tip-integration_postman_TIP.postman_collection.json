@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "TIP frontend/backend integration",
-    "description": "Local TIP + codebase_rag API. Graph storage defaults to Kuzu; TIP_GRAPH_BACKEND=sqlite selects the explicit fallback. No Neo4j server is needed. Repository ingestion is batched locally (default 500,000 files / 5 GB); requirements analysis processes every eligible file in bounded model batches and reports analyzed coverage. Analysis focus guides synthesis; it does not filter files. A 504 is retried with smaller batches, but an upstream gateway can still fail and no partial report is published. For frontend-equivalent requirements/UML analysis, call POST /analysis; the backend loads backend/tip/prompts/system.txt, applies its AnalysisResult schema, validates Mermaid, and creates the Word document. The direct gateway request is only a connectivity smoke test, not analysis. No credentials are committed in this collection.",
+    "description": "Local TIP + codebase_rag API. Graph storage defaults to Kuzu; TIP_GRAPH_BACKEND=sqlite selects the explicit fallback. No Neo4j server is needed. Repository ingestion is batched locally (default 500,000 files / 5 GB); requirements analysis processes every eligible file in bounded model batches, runs up to the configured concurrent-request limit, and reports analyzed coverage. Analysis focus guides synthesis; it does not filter files. A 504 triggers smaller batches; an irreducible smallest batch is retried with capped backoff until recovery or cancellation. Parallel requests can reduce elapsed time when the gateway accepts them, but cannot prevent an upstream outage. For frontend-equivalent requirements/UML analysis, call POST /analysis; the backend loads backend/tip/prompts/system.txt, applies its AnalysisResult schema, validates Mermaid, and generates separate technical and business Word documents from the same analysis. The direct gateway request is only a connectivity smoke test, not analysis. No credentials are committed in this collection.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -11,6 +11,7 @@
     { "key": "indexedFileCount", "value": "" },
     { "key": "analyzedFileCount", "value": "" },
     { "key": "analysisBatchCount", "value": "" },
+    { "key": "analysisBatchConcurrency", "value": "" },
     { "key": "repoUrl", "value": "https://github.com/saketgudimella31/Project-TIP" },
     { "key": "branch", "value": "main" },
     { "key": "selectedPath", "value": "" },
@@ -134,6 +135,17 @@
     },
     {
       "name": "Configuration capabilities",
+      "event": [{
+        "listen": "test",
+        "script": { "type": "text/javascript", "exec": [
+          "pm.test('Analysis batch concurrency is bounded', function () {",
+          "  pm.response.to.have.status(200);",
+          "  const config = pm.response.json();",
+          "  pm.expect(config.analysis_batch_concurrency).to.be.within(1, 8);",
+          "  pm.collectionVariables.set('analysisBatchConcurrency', config.analysis_batch_concurrency);",
+          "});"
+        ] }
+      }],
       "request": { "method": "GET", "url": "{{baseUrl}}/configuration" }
     },
     {
@@ -160,7 +172,7 @@
     },
     {
       "name": "Analyze uploaded code, Excel and Word (choose files first)",
-      "description": "Frontend-equivalent multipart analysis request. Select local files for code_files, requirements_files, and/or design_files. The backend supplies its own system prompt and Mermaid/AnalysisResult contract; poll the returned taskId, then download the Word document.",
+      "description": "Frontend-equivalent multipart analysis request. Select local files for code_files, requirements_files, and/or design_files. The backend supplies its own system prompt and Mermaid/AnalysisResult contract, analyzes bounded batches with configured concurrency, and generates technical and business Word documents; poll the returned taskId before downloading either document.",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [
@@ -224,7 +236,7 @@
     },
     {
       "name": "List tasks",
-      "request": { "method": "GET", "url": "{{baseUrl}}/tasks?limit=100" }
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks?limit=100&include_result=false" }
     },
     {
       "name": "Retrieve indexed source context",
@@ -286,7 +298,7 @@
     },
     {
       "name": "Analyze actual indexed source (requires AI gateway)",
-      "description": "Frontend-equivalent indexed analysis request. Sends AnalysisOptions to the local backend; the focus variable guides synthesis but does not select or exclude files. Every eligible indexed file is analyzed in bounded batches. Results include exact analyzed coverage and batch count; the backend validates each batch and generates the Word document only after all batches succeed.",
+      "description": "Frontend-equivalent indexed analysis request. Sends AnalysisOptions to the local backend; the focus variable guides synthesis but does not select or exclude files. Every eligible indexed file is analyzed in bounded, parallel batches. Results include exact analyzed coverage and batch count; the backend validates each batch and generates separate technical and business Word documents only after all batches succeed.",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [

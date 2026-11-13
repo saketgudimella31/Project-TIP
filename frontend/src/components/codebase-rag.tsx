@@ -77,7 +77,7 @@ export function CodebaseRag({
         <Button type="submit" disabled={running}>Index repository</Button>
         <p className="text-sm text-slate-600">
           Private repositories require Git credentials configured on the backend; do not put credentials in the URL.
-          Repositories are indexed in local batches up to {config?.max_repository_files?.toLocaleString() ?? '500,000'} readable files
+          Repositories are indexed in local batches up to {config?.max_repository_files?.toLocaleString() ?? '100,000'} readable files
           with a per-file size cap of {((config?.max_repository_file_bytes ?? 30000000) / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB.
           Larger indexes retain SQLite full-text search; graph and vector indexing may be skipped.
           Git clone/checkout operations time out after {config?.repository_clone_timeout_seconds?.toLocaleString() ?? '600'} seconds.

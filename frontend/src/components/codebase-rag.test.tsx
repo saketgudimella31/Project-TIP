@@ -23,12 +23,13 @@ const config: Configuration = {
   persistence_configured: true, persistence_backend: 'SQLite',
   graph_backend: 'kuzu', graph_configured: true, retrieval_backend: 'SQLite FTS5',
   graph_limitations: [], jira_configured: false, server_directories_enabled: false,
-  max_upload_bytes: 30000000, max_files: 500, max_artifact_characters: 150000,
-  max_repository_files: 500000, max_repository_bytes: 5000000000,
-  max_repository_file_bytes: 30000000,
-  repository_clone_timeout_seconds: 600,
+  max_upload_bytes: 5000000000, max_files: 500, max_artifact_characters: 150000,
+  max_repository_files: 1000000, max_repository_bytes: 10000000000,
+  max_repository_file_bytes: 100000000,
+  repository_clone_timeout_seconds: 1800,
   max_analysis_files: 100, max_analysis_characters: 150000,
   analysis_batch_files: 5, analysis_batch_characters: 25000,
+  analysis_batch_concurrency: 2,
 }
 
 function setup() {

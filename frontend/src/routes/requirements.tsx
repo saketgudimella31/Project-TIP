@@ -129,6 +129,8 @@ export function RequirementsPanel({
   const updateStory = (index: number, patch: Partial<ManualStory>) =>
     setStories((current) => current.map((story, i) => i === index ? { ...story, ...patch } : story))
   const codeSource = options.code_source
+  const needsDiagramRenderer = codeSource !== 'uploads' || uploads.code_files.length > 0
+  const diagramRendererMissing = config.data?.diagram_renderer_configured === false
   const setCodeSource = (value: AnalysisOptions['code_source']) => {
     setOptions((current) => ({
       ...current, code_source: value, selected_path: undefined, focus: undefined,
@@ -159,6 +161,13 @@ export function RequirementsPanel({
       setValidationError('Provide at least one source: code, Word design, Excel requirements, or stories.')
       return
     }
+    if (needsDiagramRenderer && diagramRendererMissing) {
+      setValidationError(
+        config.data?.diagram_renderer_issue
+          ?? 'Install Node.js 22.12+ and the Mermaid dependencies in frontend, then restart TIP.',
+      )
+      return
+    }
     if (config.data) {
       const files = Object.values(uploads).flat()
       if (files.length > config.data.max_files || files.reduce((total, file) => total + file.size, 0) > config.data.max_upload_bytes) {
@@ -177,14 +186,18 @@ export function RequirementsPanel({
     <div className="space-y-6">
       <header>
         <h1 className="text-3xl font-bold flex items-center gap-2"><FileText />Requirements &amp; UML</h1>
-        <p className="mt-2 text-muted-foreground">
-          Add source artifacts to generate draft requirements and UML.
-        </p>
       </header>
       {config.isError && <p role="alert">Backend configuration unavailable: {errorMessage(config.error)}</p>}
       {config.data?.analysis_prompts_configured === false && (
         <p role="alert" className="rounded border border-amber-500 p-3">
           {config.data.analysis_prompt_issue ?? 'The backend analysis prompt is missing or unreadable.'}
+        </p>
+      )}
+      {diagramRendererMissing && (
+        <p role="alert" className="rounded border border-amber-500 p-3">
+          Code-based analysis requires embedded UML images; TIP will not publish text-only UML reports.
+          {' '}{config.data?.diagram_renderer_issue
+            ?? 'Install Node.js 22.12+ and the Mermaid dependencies in frontend, then restart TIP.'}
         </p>
       )}
       {config.data && !config.data.gateway_configured && (
@@ -263,10 +276,6 @@ export function RequirementsPanel({
                   folder={options.upload_kind === 'LOCAL_FOLDER'}
                   files={uploads.code_files}
                   onChange={(files) => setUploads({ ...uploads, code_files: files })} />
-                <p className="text-sm text-slate-600">
-                  Every eligible file is analyzed in bounded batches together with the supplied evidence.
-                  {' '}The per-artifact text limit is {config.data?.max_artifact_characters?.toLocaleString() ?? '150,000'} characters; all batches must succeed before a Word document is published.
-                </p>
               </>}
               {codeSource === 'repository' && <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2 md:col-span-2">
@@ -282,10 +291,6 @@ export function RequirementsPanel({
                   <Label htmlFor="selected-path">Selected subdirectory (optional)</Label>
                   <Input id="selected-path" placeholder="e.g. src/application"
                     value={options.selected_path ?? ''} onChange={(e) => setOptions({ ...options, selected_path: e.target.value || undefined })} />
-                  <p className="text-sm text-slate-600">
-                    Leave blank to analyze the whole repository. Use a path relative to the repository root; select the branch separately.
-                    {' '}Selected subdirectories use sparse checkout; blob filtering depends on Git host support.
-                  </p>
                 </div>
                 <div className="space-y-2 md:col-span-2">
                   <Label htmlFor="analysis-focus">Analysis focus (recommended for large repositories)</Label>
@@ -293,30 +298,17 @@ export function RequirementsPanel({
                     placeholder="e.g. order status, authentication, payment flows"
                     value={options.focus ?? ''}
                     onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
-                  <p className="text-sm text-slate-600">
-                    {config.data
-                      ? `TIP indexes up to ${config.data.max_repository_files?.toLocaleString() ?? '500,000'} readable files / ${((config.data.max_repository_bytes ?? 5_000_000_000) / 1_000_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB (per-file caps ${((config.data.max_repository_file_bytes ?? 30_000_000) / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB / ${config.data.max_artifact_characters.toLocaleString()} text characters), then analyzes every eligible file in batches of up to ${config.data.analysis_batch_files.toLocaleString()} files / ${config.data.analysis_batch_characters.toLocaleString()} characters. Git clone/checkout operations time out after ${config.data.repository_clone_timeout_seconds?.toLocaleString() ?? '600'} seconds.`
-                      : 'TIP indexes the repository locally and analyzes every eligible file in bounded batches.'}
-                    {' '}Analysis focus guides synthesis; it does not filter files. Large repositories may require many gateway requests. A 504 is retried with smaller batches, but an upstream gateway can still fail.
-                  </p>
                 </div>
               </div>}
               {codeSource === 'local' && <div className="space-y-2">
                 <Label htmlFor="local-path">Server path inside the configured allowed root</Label>
                 <Input id="local-path" required value={options.local_path ?? ''}
                   onChange={(e) => setOptions({ ...options, local_path: e.target.value })} />
-                <p className="text-sm">This is a backend server path, not a path on your browser's computer.</p>
                 <Label htmlFor="local-analysis-focus">Analysis focus (recommended for large directories)</Label>
                 <Input id="local-analysis-focus" maxLength={2000}
                   placeholder="e.g. order status, authentication, payment flows"
                   value={options.focus ?? ''}
                   onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
-                <p className="text-sm text-slate-600">
-                  The local index can contain up to {config.data?.max_repository_files?.toLocaleString() ?? '500,000'} readable files.
-                  Every eligible file is analyzed in batches of up to {config.data?.analysis_batch_files?.toLocaleString() ?? '5'} files / {config.data?.analysis_batch_characters?.toLocaleString() ?? '25,000'} characters.
-                  {' '}Analysis focus is guidance, not a file filter; large directories may require many gateway requests.
-                  {' '}Individual artifacts over {config.data?.max_artifact_characters?.toLocaleString() ?? '150,000'} text characters are not included.
-                </p>
               </div>}
             </CardContent>
           </Card>
@@ -337,17 +329,11 @@ export function RequirementsPanel({
                   files={uploads.story_files}
                   onChange={(files) => setUploads({ ...uploads, story_files: files })} />
               </div>
-              <div className="space-y-2">
+              {config.data?.jira_configured && <div className="space-y-2">
                 <Label htmlFor="jira-keys">Jira story keys (optional)</Label>
                 <Input id="jira-keys" placeholder="TIP-123, TIP-456" value={jiraKeys}
-                  disabled={!config.data?.jira_configured} onChange={(e) => setJiraKeys(e.target.value)} />
-                {!config.data?.jira_configured && <p className="text-sm text-slate-600">Jira unavailable. Upload stories or add them below.</p>}
-              </div>
-              <details className="text-sm text-slate-600">
-                <summary>Supported input details</summary>
-                <p className="mt-2">Sensitive filenames and generated/dependency directories are excluded. Excel source locations remain traceable; formulas are not executed.</p>
-                <p className="mt-2">Story JSON: an array with id, title, description, and optional acceptanceCriteria and priority.</p>
-              </details>
+                  onChange={(e) => setJiraKeys(e.target.value)} />
+              </div>}
               <h3 className="font-semibold">Manual user stories</h3>
               {stories.map((story, index) => (
                 <div className="rounded border p-4 space-y-3" key={index}>
@@ -383,10 +369,6 @@ export function RequirementsPanel({
               </Button>
             </CardContent>
           </Card>
-          <p className="text-sm">
-            Supporting requirements do not prove implementation. Output is a draft requiring human review.
-            Review uploads for secrets before submission.
-          </p>
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={automaticDownload}
               onChange={(event) => setAutomaticDownload(event.target.checked)} />
@@ -394,7 +376,8 @@ export function RequirementsPanel({
           </label>
           <Button type="submit" className="bg-blue-700 text-white shadow-sm hover:bg-blue-800"
             disabled={!config.data?.gateway_configured || !config.data?.gateway_auth_configured
-              || !config.data?.persistence_configured || config.data?.analysis_prompts_configured === false}>
+              || !config.data?.persistence_configured || config.data?.analysis_prompts_configured === false
+              || (needsDiagramRenderer && diagramRendererMissing)}>
             {submit.isPending ? 'Uploading...' : 'Generate requirements & Word documents'}
           </Button>
         </fieldset>
