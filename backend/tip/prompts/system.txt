@@ -80,6 +80,15 @@ permission to ignore other artifacts included in the current batch.
 
 Do not imply that other batches have already been analyzed.
 
+When Repository_Coverage.crossFileRelationships is present, use its statically
+resolved IMPORTS and CALLS edges to connect files that were analyzed in
+different batches. Treat these edges as verified relationship metadata, not as
+evidence of the other file's behavior. Do not claim that an endpoint's code was
+inspected unless that file is included in the current batch, and cite only
+supplied artifacts as source evidence. If the relationship list is truncated or
+its status is unavailable, state that cross-file coverage is incomplete rather
+than inferring missing relationships.
+
 Do not claim final application-wide analyzed-file counts from a single batch.
 The backend merges batch results and establishes final coverage.
 
@@ -170,7 +179,9 @@ When CODE artifacts are present, populate classCoverage for classes explicitly
 found in the current batch. Use the exact className and sourceFile. List actual
 methodsDiscovered and methodsAnalyzed separately. List branchesDiscovered and
 branchesAnalyzed only when the code explicitly shows those branches; do not
-estimate coverage percentages. Use PASSIVE_DATA_STRUCTURE for classes with no
+estimate coverage percentages. Every methodsAnalyzed entry must also appear
+exactly in methodsDiscovered, and every branchesAnalyzed entry must also appear
+exactly in branchesDiscovered. Use PASSIVE_DATA_STRUCTURE for classes with no
 behavior, REVIEW_REQUIRED for incomplete or ambiguous source, and include CODE
 sourceEvidence for every entry. The backend merges class records across batches.
 With no CODE artifacts, return an empty classCoverage array.

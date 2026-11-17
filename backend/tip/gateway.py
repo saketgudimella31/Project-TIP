@@ -217,6 +217,11 @@ _ABSENT_SINGLETON_DIAGRAM = {
     "reason": "Not evidenced in the supplied artifacts.",
 }
 
+CLASS_COVERAGE_WARNING = (
+    "Some model-reported analyzed methods or branches were absent from the corresponding "
+    "discovered list and were excluded from coverage counts. Review the affected classes."
+)
+
 
 def normalize_model_result(result: dict) -> dict:
     analysis_scope = result.get("analysisScope")
@@ -232,6 +237,38 @@ def normalize_model_result(result: dict) -> dict:
             analysis_scope[correct_name] = analysis_scope.pop(
                 incorrect_name
             )
+
+    coverage = result.get("classCoverage")
+    repaired = False
+    if isinstance(coverage, list):
+        for item in coverage:
+            if not isinstance(item, dict):
+                continue
+            item_repaired = False
+            for discovered_key, analyzed_key in (
+                ("methodsDiscovered", "methodsAnalyzed"),
+                ("branchesDiscovered", "branchesAnalyzed"),
+            ):
+                discovered = item.get(discovered_key, [])
+                analyzed = item.get(analyzed_key, [])
+                if not (
+                    isinstance(discovered, list) and isinstance(analyzed, list)
+                    and all(isinstance(value, str) for value in [*discovered, *analyzed])
+                ):
+                    continue
+                retained = [value for value in analyzed if value in discovered]
+                if len(retained) != len(analyzed):
+                    item[analyzed_key] = retained
+                    item_repaired = True
+            if item_repaired:
+                repaired = True
+                if item.get("analysisStatus") in (
+                    "ANALYZED", "PASSIVE_DATA_STRUCTURE", "REVIEW_REQUIRED",
+                ):
+                    item["analysisStatus"] = "REVIEW_REQUIRED"
+    if repaired and isinstance(result.get("warnings"), list):
+        if CLASS_COVERAGE_WARNING not in result["warnings"]:
+            result["warnings"].append(CLASS_COVERAGE_WARNING)
 
     uml_diagrams = result.get("umlDiagrams")
 

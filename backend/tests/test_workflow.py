@@ -33,7 +33,7 @@ from tip.documents import (
     render_generated_diagrams,
 )
 from tip.extraction import Extractor, jira_stories, source_directory
-from tip.gateway import Gateway, GatewayError, model_body, signed_headers
+from tip.gateway import CLASS_COVERAGE_WARNING, Gateway, GatewayError, model_body, signed_headers
 from tip.models import (
     AnalysisOptions, ChildRequirement, ClassCoverage, InputContext, StoryEvidence,
     SupportingInputs,
@@ -693,6 +693,12 @@ def test_model_body_and_fresh_signature(tmp_path, monkeypatch):
         "indexedCodeFiles": 10, "retrievedCodeFiles": 1,
         "retrievedCharacters": len(artifact[0].content),
         "selectionMethod": "focused indexed retrieval",
+        "crossFileRelationshipStatus": "available",
+        "crossFileRelationships": [{
+            "source": "orders.py", "target": "payments.py", "type": "IMPORTS",
+            "line": 3, "crossBatch": True,
+        }],
+        "crossFileRelationshipsTruncated": False,
     }
     covered = json.loads(model_body(
         "Orders", input_context(), artifact, config, coverage,
@@ -830,6 +836,67 @@ def test_gateway_http_contract_and_truncated_output(tmp_path, monkeypatch):
         Gateway(config).analyze("Orders", input_context(), artifacts)
     assert error.value.retry_after == 1.5
     assert error.value.error_code == "insufficient_quota"
+
+
+def test_gateway_handles_inconsistent_class_coverage_conservatively(tmp_path, monkeypatch):
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "orders.py", b"class Orders:\n    def status(self): return True\n",
+    )
+    raw = sample_result("Orders", input_context(), artifacts).model_dump()
+    evidence = raw["highLevelRequirements"][0]["sourceEvidence"]
+    raw["classCoverage"] = [{
+        "className": "Orders", "sourceFile": "orders.py", "analysisStatus": "ANALYZED",
+        "methodsDiscovered": ["status"], "methodsAnalyzed": ["status", "missing"],
+        "branchesDiscovered": ["ready"], "branchesAnalyzed": ["unknown"],
+        "sourceEvidence": evidence, "notes": "",
+    }, {
+        "className": "Valid", "sourceFile": "orders.py", "analysisStatus": "ANALYZED",
+        "methodsDiscovered": ["valid"], "methodsAnalyzed": ["valid"],
+        "branchesDiscovered": [], "branchesAnalyzed": [],
+        "sourceEvidence": evidence, "notes": "",
+    }]
+    gateway = Gateway(settings(tmp_path))
+    monkeypatch.setattr(gateway, "_send", lambda body: raw)
+
+    result = gateway.analyze("Orders", input_context(), artifacts)
+    validate_result(result, artifacts, input_context(), "Orders")
+
+    first, second = result.classCoverage
+    assert first.methodsAnalyzed == ["status"]
+    assert first.methodsDiscovered == ["status"]
+    assert first.branchesAnalyzed == []
+    assert first.analysisStatus == "REVIEW_REQUIRED"
+    assert second.analysisStatus == "ANALYZED"
+    assert CLASS_COVERAGE_WARNING in result.warnings
+    canonical = canonical_requirements(result)
+    assert CLASS_COVERAGE_WARNING in canonical["coverageGaps"]
+    gateway.close()
+
+
+def test_gateway_does_not_hide_invalid_coverage_data(tmp_path, monkeypatch):
+    artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"class Orders: pass")
+    raw = sample_result("Orders", input_context(), artifacts).model_dump()
+    raw["classCoverage"] = [{
+        "className": "Orders", "sourceFile": "orders.py", "analysisStatus": "ANALYZED",
+        "methodsDiscovered": [], "methodsAnalyzed": [42],
+        "sourceEvidence": raw["highLevelRequirements"][0]["sourceEvidence"],
+    }]
+    gateway = Gateway(settings(tmp_path))
+    monkeypatch.setattr(gateway, "_send", lambda body: raw)
+    with pytest.raises(ValidationError):
+        gateway.analyze("Orders", input_context(), artifacts)
+    gateway.close()
+
+
+def test_class_coverage_rejects_unknown_source_file(tmp_path):
+    artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"class Orders: pass")
+    result = sample_result("Orders", input_context(), artifacts)
+    result.classCoverage = [ClassCoverage(
+        className="Orders", sourceFile="other.py", analysisStatus="ANALYZED",
+        sourceEvidence=result.highLevelRequirements[0].sourceEvidence,
+    )]
+    with pytest.raises(ValueError, match="Class coverage must cite its supplied source file"):
+        validate_result(result, artifacts, input_context(), "Orders")
 
 
 def test_validation_rejects_unknown_evidence_and_false_implementation(tmp_path):

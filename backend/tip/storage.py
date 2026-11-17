@@ -611,6 +611,15 @@ class Store:
         with self.lock, self.connect() as db:
             return self.graph.impact(repo_id, file, self._sources(db, repo_id), depth, limit)
 
+    def graph_relationships(
+        self, repo_id: str, paths: set[str], path_prefix: str | None = None,
+    ) -> dict | None:
+        if self.graph is None:
+            return None
+        return self.graph.relationships_for_files(
+            repo_id, paths, path_prefix=path_prefix,
+        )
+
     def symbols(self, repo_id: str) -> dict:
         if self.graph is None:
             raise RuntimeError("Code graph is not configured")

@@ -328,6 +328,20 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
             "IMPLEMENTATION_EVIDENCED", "IMPLEMENTATION_PARTIALLY_EVIDENCED",
         } and "CODE" not in origins:
             raise ValueError("Requirement claims implementation without cited code")
+    for coverage in result.classCoverage:
+        for evidence in coverage.sourceEvidence:
+            check(evidence)
+        if not any(
+            artifact.sourceType == "CODE"
+            and artifact.filePath == coverage.sourceFile
+            and any(
+                evidence.sourceName == artifact.sourceName
+                and (evidence.filePath is None or evidence.filePath == artifact.filePath)
+                for evidence in coverage.sourceEvidence
+            )
+            for artifact in artifacts
+        ):
+            raise ValueError("Class coverage must cite its supplied source file")
     generated_names = set()
     for name, diagram in result.umlDiagrams.entries():
         if diagram.generated:
