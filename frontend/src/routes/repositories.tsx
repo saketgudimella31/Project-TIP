@@ -2,7 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { RequirementsPanel } from './requirements'
 
 export const Route = createFileRoute('/repositories')({
-  validateSearch: (search: Record<string, unknown>): { task?: string } => ({
+  validateSearch: (search: Record<string, unknown>) => ({
     task: typeof search.task === 'string' ? search.task : undefined,
   }),
   component: Repositories,

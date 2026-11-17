@@ -22,8 +22,11 @@ vi.mock('../lib/requirements-api', () => ({
     documentUrl: (id: string) =>
       `/api/v1/tasks/${id}/document`,
 
-    businessDocumentUrl: (id: string) =>
-      `/api/v1/tasks/${id}/business-document`,
+    qtestUrl: (id: string) =>
+      `/api/v1/tasks/${id}/qtest-xlsx`,
+
+    artifactsUrl: (id: string) =>
+      `/api/v1/tasks/${id}/artifacts.zip`,
 
     analysisUrl: (id: string) =>
       `/api/v1/tasks/${id}/analysis`,
@@ -40,7 +43,7 @@ beforeEach(() => {
 
 
 it(
-  'automatically downloads the completed technical Word document only once',
+  'automatically downloads the consolidated requirements DOCX only once',
   async () => {
     vi.mocked(
       requirementsApi.download,
@@ -113,7 +116,7 @@ it(
 
 
 it(
-  'shows both requirements document downloads',
+  'shows the all-artifacts ZIP and individual final output downloads',
   () => {
     render(
       <DocumentDownload
@@ -126,11 +129,14 @@ it(
       requirementsApi.download,
     ).not.toHaveBeenCalled()
 
+    expect(screen.getByRole('link', { name: 'Download all artifacts (ZIP)' }))
+      .toHaveAttribute('href', '/api/v1/tasks/old-task/artifacts.zip')
+
     expect(
       screen.getByRole(
         'link',
         {
-          name: 'Download Technical Requirements',
+          name: 'Final requirements DOCX',
         },
       ),
     ).toHaveAttribute(
@@ -138,23 +144,17 @@ it(
       '/api/v1/tasks/old-task/document',
     )
 
-    expect(
-      screen.getByRole(
-        'link',
-        {
-          name: 'Download Non-Technical FRS',
-        },
-      ),
-    ).toHaveAttribute(
-      'href',
-      '/api/v1/tasks/old-task/business-document',
-    )
+    expect(screen.getByRole('link', { name: 'Canonical requirements JSON' }))
+      .toHaveAttribute('href', '/api/v1/tasks/old-task/analysis')
+    expect(screen.getByRole('link', { name: 'qTest requirements XLSX' }))
+      .toHaveAttribute('href', '/api/v1/tasks/old-task/qtest-xlsx')
+    expect(screen.getAllByRole('link')).toHaveLength(4)
   },
 )
 
 
 it(
-  'shows automatic download failures and keeps both manual downloads available',
+  'shows automatic download failures and keeps all final output links available',
   async () => {
     vi.mocked(
       requirementsApi.download,
@@ -179,7 +179,7 @@ it(
       screen.getByRole(
         'link',
         {
-          name: 'Download Technical Requirements',
+          name: 'Final requirements DOCX',
         },
       ),
     ).toBeInTheDocument()
@@ -188,7 +188,7 @@ it(
       screen.getByRole(
         'link',
         {
-          name: 'Download Non-Technical FRS',
+          name: 'qTest requirements XLSX',
         },
       ),
     ).toBeInTheDocument()

@@ -34,7 +34,16 @@ from tip.documents import (
 )
 from tip.extraction import Extractor, jira_stories, source_directory
 from tip.gateway import Gateway, GatewayError, model_body, signed_headers
-from tip.models import AnalysisOptions, InputContext, ManualStory, SupportingInputs
+from tip.models import (
+    AnalysisOptions, ChildRequirement, ClassCoverage, InputContext, StoryEvidence,
+    SupportingInputs,
+)
+from tip.outputs import (
+    canonical_json_bytes,
+    canonical_requirements,
+    create_final_document,
+    create_qtest_workbook,
+)
 from tip.storage import Store
 from tip.validation import INVALID_DIAGRAM_WARNING, validate_mermaid, validate_result
 from codebase_rag.services.knowledge.local_store import Embeddings, LocalKnowledge
@@ -134,6 +143,58 @@ def test_task_history_can_omit_large_results(tmp_path):
     assert completed_task["result"]["large_output"] == "x" * 50_000
 
 
+def test_clear_analysis_history_preserves_active_tasks_and_repository_indexes(tmp_path):
+    app = create_app(settings(tmp_path, graph_backend="sqlite"))
+    store = app.state.store
+    completed = store.create({"kind": "analysis", "target_application": "Old"})
+    analysis = {
+        "documentInformation": {"targetApplication": "Old"},
+        "documentTitle": "Old requirements",
+        "highLevelRequirements": [],
+        "nonFunctionalRequirements": [],
+    }
+    store.complete(
+        completed["task_id"], {"analysis": analysis}, b"doc",
+        canonical_json=b"{}", qtest_xlsx=b"xlsx",
+    )
+    with store.connect() as db:
+        store.knowledge.index(db, f"analysis:{completed['task_id']}", [{
+            "ref": "old.py", "content": "old analysis source", "metadata": {},
+        }])
+    failed = store.create({"kind": "analysis", "target_application": "Failed"})
+    store.update(failed["task_id"], status="failed", progress=100, message="Failed")
+    ingest = store.create({"kind": "ingest"})
+    store.complete(ingest["task_id"], {"repo_id": "keep-repo"}, None)
+    repository_artifacts = Extractor(settings(tmp_path)).extract(
+        "src.py", b"def retained(): pass",
+    )
+    store.index(
+        "keep-repo", repository_artifacts, include_knowledge=False, include_graph=False,
+    )
+
+    with TestClient(app) as client:
+        active = store.create({"kind": "analysis", "target_application": "Active"})
+        response = client.delete("/api/v1/tasks/analysis-history")
+
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 2
+    assert response.json()["active_count"] == 1
+    assert set(response.json()["deleted_task_ids"]) == {
+        completed["task_id"], failed["task_id"],
+    }
+    assert store.get(completed["task_id"]) is None
+    assert store.get(failed["task_id"]) is None
+    assert store.get(active["task_id"]) is not None
+    assert store.get(ingest["task_id"]) is not None
+    assert store.index_stats("keep-repo")[0] == 1
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM analysis_records").fetchone()[0] == 0
+        assert db.execute(
+            "SELECT count(*) FROM rag_chunks WHERE scope=?",
+            (f"analysis:{completed['task_id']}",),
+        ).fetchone()[0] == 0
+
+
 def test_gateway_repairs_missing_functional_capability_and_warns(tmp_path, monkeypatch):
     settings_value = settings(
         tmp_path, gateway_url="https://gateway.example/completions",
@@ -175,6 +236,89 @@ def test_input_context_accepts_miscased_jira_story_flag():
 
     assert parsed.supportingInputs.jiraUserStoriesProvided is False
     assert "jiraUserStoriesProvided" in parsed.supportingInputs.model_dump()
+
+
+def test_document_only_outputs_do_not_claim_implementation_or_classes(tmp_path):
+    artifact = Extractor(settings(tmp_path)).extract(
+        "requirements.txt", b"The system shall display order status.", "RAW_REQUIREMENT",
+    )
+    result = sample_result("Orders", input_context(), artifact)
+
+    canonical = canonical_requirements(result)
+    workbook = openpyxl.load_workbook(io.BytesIO(create_qtest_workbook(canonical)))
+
+    assert canonical["project"]["analysisMode"] == "DOCUMENTS"
+    assert canonical["project"]["implementationVerified"] == "NO"
+    assert canonical["analysisSummary"]["classesAnalyzed"] is None
+    assert canonical["classCoverage"] == []
+    assert canonical["requirements"][0]["implementationVerified"] is False
+    assert workbook.sheetnames == ["Cover Page", "Requirements"]
+    assert workbook["Requirements"].max_column == 26
+    assert workbook["Requirements"]["Y2"].value == "NO"
+    assert b'"implementationVerified": false' in canonical_json_bytes(canonical)
+
+
+def test_parent_child_ids_match_json_workbook_and_docx(tmp_path):
+    artifact = Extractor(settings(tmp_path)).extract(
+        "orders.py", b"def order_status(): return 'ready'", "CODE",
+    )
+    result = sample_result("Orders", input_context(), artifact)
+    parent = result.highLevelRequirements[0]
+    parent.childRequirements = [ChildRequirement(
+        name="Ready status",
+        requirement="The system shall display a ready status when the source reports ready.",
+        acceptanceCriterion="The displayed status is ready.",
+        priority=None,
+        sourceEvidence=parent.sourceEvidence,
+        implementationEvidenceStatus="IMPLEMENTATION_EVIDENCED",
+        evidenceStatus="VERIFIED",
+        validationNotes="",
+    )]
+    result.classCoverage = [ClassCoverage(
+        className="OrderService",
+        sourceFile="orders.py",
+        analysisStatus="ANALYZED",
+        methodsDiscovered=["order_status"],
+        methodsAnalyzed=["order_status"],
+        branchesDiscovered=[],
+        branchesAnalyzed=[],
+        notes="",
+        sourceEvidence=parent.sourceEvidence,
+    )]
+
+    canonical = canonical_requirements(result)
+    workbook = openpyxl.load_workbook(io.BytesIO(create_qtest_workbook(canonical)))
+    rows = list(workbook["Requirements"].iter_rows(values_only=True))
+    document = Document(io.BytesIO(create_final_document(result, canonical, {})))
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    assert [row[10] for row in rows[1:]] == ["HLR-001", "HLR-001.1"]
+    assert rows[2][20] == "HLR-001"
+    assert rows[2][21] == "Child"
+    assert "HLR-001.1: Ready status" in text
+    assert canonical["analysisSummary"]["childRequirements"] == 1
+    assert canonical["analysisSummary"]["classesDiscovered"] == 1
+    assert canonical["analysisSummary"]["classesAnalyzed"] == 1
+    assert canonical["classCoverage"][0]["parentRequirements"] == ["HLR-001"]
+
+
+def test_qtest_export_supports_custom_field_headers_and_defaults(tmp_path, monkeypatch):
+    artifact = Extractor(settings(tmp_path)).extract(
+        "requirements.txt", b"The system shall display order status.", "RAW_REQUIREMENT",
+    )
+    canonical = canonical_requirements(
+        sample_result("Orders", input_context(), artifact),
+    )
+    monkeypatch.setenv(
+        "TIP_QTEST_FIELD_MAPPING_JSON",
+        '{"Parent Requirement ID":"Parent Req"}',
+    )
+    monkeypatch.setenv("TIP_QTEST_DEFAULT_VALUES_JSON", '{"Sprint":"Sprint 1"}')
+
+    workbook = openpyxl.load_workbook(io.BytesIO(create_qtest_workbook(canonical)))
+
+    assert workbook["Requirements"]["U1"].value == "Parent Req"
+    assert workbook["Requirements"]["N2"].value == "Sprint 1"
 
 
 def workbook_bytes():
@@ -238,6 +382,36 @@ def test_office_extraction_preserves_provenance(tmp_path):
     designs = extractor.extract("design.docx", docx_bytes(), "DESIGN_DOCUMENT")
     assert "Orders design" in designs[0].content
     assert "Capability | Display order status" in designs[0].content
+
+
+def test_pdf_extraction_preserves_page_provenance(tmp_path):
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=200, height=100)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({
+            NameObject("/F1"): writer._add_object(font),
+        }),
+    })
+    contents = DecodedStreamObject()
+    contents.set_data(b"BT /F1 12 Tf 10 50 Td (Order status) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(contents)
+    pdf = io.BytesIO()
+    writer.write(pdf)
+
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "requirements.pdf", pdf.getvalue(), "DESIGN_DOCUMENT"
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].sourceName == "requirements.pdf"
+    assert artifacts[0].content == "[Page 1]\nOrder status"
 
 
 def test_legacy_xls_preserves_sheet_and_physical_row(tmp_path):
@@ -326,7 +500,7 @@ def test_empty_and_placeholder_input_rejected(tmp_path):
     with pytest.raises(ValueError, match="No readable"):
         extractor.artifact("CODE", "app.txt", "{{Codebase_Data}}")
     with pytest.raises(ValidationError):
-        ManualStory(id="US-1", title=" ", description="story")
+        StoryEvidence(id="US-1", title=" ", description="story")
     assert settings(tmp_path, local_source_root="").local_source_root is None
 
 
@@ -660,7 +834,7 @@ def test_gateway_http_contract_and_truncated_output(tmp_path, monkeypatch):
 
 def test_validation_rejects_unknown_evidence_and_false_implementation(tmp_path):
     extractor = Extractor(settings(tmp_path))
-    artifact = extractor.story(ManualStory(
+    artifact = extractor.story(StoryEvidence(
         id="US-1", title="Order status", description="The system shall display order status."
     ))
     result = sample_result("Orders", input_context(), [artifact])
@@ -740,10 +914,6 @@ def test_missing_mermaid_renderer_rejects_generated_diagrams(tmp_path, monkeypat
 
     with pytest.raises(ValueError, match="Local Mermaid rendering is unavailable"):
         render_generated_diagrams(result)
-    with pytest.raises(ValueError, match="has no rendered PNG"):
-        create_document(result, {"componentDiagram": None})
-    with pytest.raises(ValueError, match="has no rendered PNG"):
-        create_business_document(result, {"componentDiagram": None})
 
 
 def test_business_document_uses_stakeholder_format_without_inventing_context(tmp_path):
@@ -948,14 +1118,20 @@ def test_labeled_class_diagram_renders_without_native_resvg_panic(
     assert rendered["classDiagram"].startswith(
         b"\x89PNG\r\n\x1a\n"
     )
-    
-    assert rendered_sources == [source]
+
+    assert "GLReportService --> ReportBuilder" in rendered_sources[0]
+    assert ": creates" not in rendered_sources[0]
+    assert "+generate(report: dict): bytes" not in rendered_sources[0]
+    assert "class GLReportService" in rendered_sources[0]
+
     assert result.umlDiagrams.classDiagram.mermaid == source
-    assert not any(
+
+    assert any(
         "Class member details and relationship captions were omitted"
-        in warning
-        for warning in result.warnings
+        in item
+        for item in result.warnings
     )
+
     assert zipfile.is_zipfile(
         io.BytesIO(create_document(result, rendered))
     )
@@ -964,7 +1140,8 @@ def test_labeled_class_diagram_renders_without_native_resvg_panic(
         io.BytesIO(create_business_document(result, rendered))
     )
 
-def test_component_diagram_render_failure_is_not_silently_omitted(
+
+def test_component_diagram_retries_with_safe_mermaid_source(
     tmp_path,
     monkeypatch,
 ):
@@ -972,28 +1149,75 @@ def test_component_diagram_render_failure_is_not_silently_omitted(
         "server.py",
         b"def delegate_to_rag(): pass\n",
     )
+
     result = sample_result(
         "Local RAG Server",
         input_context(),
         artifacts,
-        with_diagram=True,
     )
 
-    diagram = result.umlDiagrams.componentDiagram
-    original_source = diagram.mermaid
+    source = (
+        "flowchart LR\n"
+        '  ENTRY["Local RAG Server<br/>Entrypoint"]\n'
+        '  SERVICE["Delegation <b>Service</b>"]\n'
+        "  ENTRY -->|delegates incoming request| SERVICE\n"
+    )
+
+    diagram = result.umlDiagrams.componentDiagram.model_copy(
+        update={
+            "generated": True,
+            "title": (
+                "Component View - "
+                "Local RAG Server Entrypoint Delegation"
+            ),
+            "description": "Local RAG delegation flow.",
+            "mermaid": source,
+            "sourceEvidence": (
+                result.highLevelRequirements[0].sourceEvidence
+            ),
+            "reason": "",
+        }
+    )
+
+    result.umlDiagrams.componentDiagram = diagram
+
     attempts = []
 
     def fake_render(candidate):
         attempts.append(candidate.mermaid)
-        raise ValueError("Local Mermaid rendering failed: browser render error")
 
-    monkeypatch.setattr("tip.documents.render_diagram", fake_render)
+        if len(attempts) == 1:
+            raise ValueError(
+                "Local Mermaid rendering failed: "
+                "thread '<unnamed>' panicked at "
+                "resvg/src/geom.rs:27:61; "
+                "called `Option::unwrap()` on a `None` value"
+            )
 
-    with pytest.raises(ValueError, match="browser render error"):
-        render_generated_diagrams(result)
+        return b"\x89PNG\r\n\x1a\nsafe-render"
 
-    assert attempts == [original_source]
-    assert diagram.mermaid == original_source
+    monkeypatch.setattr(
+        "tip.documents.render_diagram",
+        fake_render,
+    )
+
+    rendered = render_generated_diagrams(result)
+
+    assert rendered["componentDiagram"].startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+
+    assert len(attempts) == 2
+
+    # First attempt contains the original Mermaid.
+    assert "<br/>" in attempts[0]
+    assert "<b>" in attempts[0]
+    assert "|delegates incoming request|" in attempts[0]
+
+    # Retry uses the renderer-safe Mermaid source.
+    assert "<br/>" not in attempts[1]
+    assert "<b>" not in attempts[1]
+    assert "|delegates incoming request|" not in attempts[1]
 
 def test_jira_integration_extracts_adf_and_custom_acceptance(tmp_path, monkeypatch):
     config = settings(
@@ -1106,7 +1330,10 @@ def test_repository_subdirectory_uses_blobless_sparse_checkout(tmp_path, monkeyp
 
 
 def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
-    app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+    app = create_app(settings(
+        tmp_path, gateway_url="https://gateway.example/completions",
+        graph_backend="sqlite",
+    ))
     monkeypatch.setattr("tip.app.mermaid_renderer_configured", lambda: True)
     monkeypatch.setattr("tip.app.mermaid_renderer_issue", lambda: None)
     monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
@@ -1133,16 +1360,15 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
         assert configuration["diagram_renderer_configured"] is True
         assert configuration["diagram_renderer_issue"] is None
         assert "neo4j_configured" not in configuration
-        options = {
-            "target_application": "Orders", "manual_stories": [{
-                "id": "US-1", "title": "Order status",
-                "description": "The system shall display order status.",
-            }],
-        }
+        options = {"target_application": "Orders"}
         response = client.post("/api/v1/analysis", data={"options": json.dumps(options)}, files=[
             ("code_files", ("orders.py", b"def order_status(): return 'ready'", "text/plain")),
             ("design_files", ("design.docx", docx_bytes(), "application/octet-stream")),
             ("requirements_files", ("requirements.xlsx", workbook_bytes(), "application/octet-stream")),
+            ("story_files", ("stories.json", json.dumps([{
+                "id": "US-1", "title": "Order status",
+                "description": "The system shall display order status.",
+            }]).encode(), "application/json")),
         ])
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -1171,31 +1397,39 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
         analysis = client.get(f"/api/v1/tasks/{task_id}/analysis")
         assert analysis.status_code == 200
         analysis_result = analysis.json()
-        assert analysis_result["umlDiagrams"]["componentDiagram"]["generated"]
-        assert any("source component diagram" in warning for warning in analysis_result["warnings"])
+        assert analysis_result["schemaVersion"] == "2.0"
+        assert analysis_result["requirements"][0]["requirementId"] == "HLR-001"
         assert "attachment" in analysis.headers["content-disposition"]
-        assert f"TIP-analysis-{task_id}.json" in analysis.headers["content-disposition"]
+        assert "TIP-Final-Requirements-Orders.json" in analysis.headers["content-disposition"]
         document = client.get(f"/api/v1/tasks/{task_id}/document")
         assert document.status_code == 200
         assert zipfile.is_zipfile(io.BytesIO(document.content))
         assert "attachment" in document.headers["content-disposition"]
-        business_document = client.get(
-            f"/api/v1/tasks/{task_id}/business-document",
-        )
-        assert business_document.status_code == 200
-        for content, includes_source_paths in (
-            (document.content, True), (business_document.content, False),
-        ):
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                report_xml = archive.read("word/document.xml").decode()
-                assert any(
-                    name.startswith("word/media/") and name.endswith(".png")
-                    for name in archive.namelist()
-                )
-                assert "<w:drawing>" in report_xml
+        assert "TIP-Final-Requirements-Orders.docx" in document.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(document.content)) as archive:
+            report_xml = archive.read("word/document.xml").decode()
+            assert any(
+                name.startswith("word/media/") and name.endswith(".png")
+                for name in archive.namelist()
+            )
+            assert "<w:drawing>" in report_xml
             assert "Source Component Diagram" in report_xml
-            assert "Graphical rendering is unavailable" not in report_xml
-            assert ("orders.py" in report_xml) is includes_source_paths
+            assert "orders.py" in report_xml
+        qtest = client.get(f"/api/v1/tasks/{task_id}/qtest-xlsx")
+        assert qtest.status_code == 200
+        assert zipfile.is_zipfile(io.BytesIO(qtest.content))
+        artifacts = client.get(f"/api/v1/tasks/{task_id}/artifacts.zip")
+        assert artifacts.status_code == 200
+        assert artifacts.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(artifacts.content)) as archive:
+            assert archive.namelist() == [
+                "TIP-Final-Requirements-Orders.docx",
+                "TIP-Final-Requirements-Orders.json",
+                "TIP-qTest-Requirements-Orders.xlsx",
+            ]
+            assert archive.read("TIP-Final-Requirements-Orders.docx") == document.content
+            assert json.loads(archive.read("TIP-Final-Requirements-Orders.json")) == analysis.json()
+            assert archive.read("TIP-qTest-Requirements-Orders.xlsx") == qtest.content
         indexed_repo = task["result"]["repo_id"]
         related = client.get("/api/v1/graph/related",
                              params={"repoId": indexed_repo, "query": "order_status"})
@@ -1207,7 +1441,7 @@ def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
         assert impact.json()["backend"] == "sqlite"        
         assert impact.json()["nodes"] == []
         assert client.get("/api/v1/metrics").status_code == 200
-    new_app = create_app(settings(tmp_path))
+    new_app = create_app(settings(tmp_path, graph_backend="sqlite"))
     with TestClient(new_app) as client:
         assert client.get(f"/api/v1/tasks/{task_id}/document").content == document.content
         assert client.get("/api/v1/tasks").json()["total_count"] == 1
@@ -1545,8 +1779,14 @@ def test_gateway_504_splits_a_single_large_file_content_chunk(tmp_path):
         assert task["result"]["repository_coverage"]["analysisBatchCount"] == 2
 
 
-def test_smallest_batch_504_retries_until_gateway_recovers(tmp_path):
-    app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+def test_smallest_batch_504_retries_until_gateway_recovers(tmp_path, monkeypatch):
+    app = create_app(settings(
+        tmp_path, gateway_url="https://gateway.example/completions",
+        graph_backend="sqlite",
+    ))
+    monkeypatch.setattr("tip.app.mermaid_renderer_configured", lambda: True)
+    monkeypatch.setattr("tip.app.mermaid_renderer_issue", lambda: None)
+    monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
     calls = 0
 
     class RecoveringGateway:
@@ -1570,12 +1810,15 @@ def test_smallest_batch_504_retries_until_gateway_recovers(tmp_path):
         task = wait_task(client, task_id)
         assert task["status"] == "success", task.get("error")
         assert calls == 3
-        technical_document = client.get(f"/api/v1/tasks/{task_id}/document")
-        business_document = client.get(f"/api/v1/tasks/{task_id}/business-document")
-        assert technical_document.status_code == 200
-        assert business_document.status_code == 200
-        assert zipfile.is_zipfile(io.BytesIO(technical_document.content))
-        assert zipfile.is_zipfile(io.BytesIO(business_document.content))
+        final_document = client.get(f"/api/v1/tasks/{task_id}/document")
+        canonical_json = client.get(f"/api/v1/tasks/{task_id}/analysis")
+        qtest_workbook = client.get(f"/api/v1/tasks/{task_id}/qtest-xlsx")
+        assert final_document.status_code == 200
+        assert canonical_json.status_code == 200
+        assert qtest_workbook.status_code == 200
+        assert zipfile.is_zipfile(io.BytesIO(final_document.content))
+        assert zipfile.is_zipfile(io.BytesIO(qtest_workbook.content))
+        assert canonical_json.json()["schemaVersion"] == "2.0"
         with app.state.store.connect() as db:
             assert db.execute(
                 "SELECT count(*) FROM analysis_records WHERE task_id=?", (task_id,)
@@ -1710,20 +1953,28 @@ def test_smallest_batch_504_retry_can_be_cancelled(tmp_path):
         assert client.post(f"/api/v1/tasks/{task_id}/cancel").status_code == 200
         assert wait_task(client, task_id)["status"] == "cancelled"
         assert client.get(f"/api/v1/tasks/{task_id}/document").status_code == 409
-        assert client.get(f"/api/v1/tasks/{task_id}/business-document").status_code == 409
+        assert client.get(f"/api/v1/tasks/{task_id}/business-document").status_code == 404
 
 
 def test_supporting_only_does_not_claim_implementation(tmp_path):
-    app = create_app(settings(tmp_path, gateway_url="https://gateway.example/completions"))
+    app = create_app(settings(
+        tmp_path, gateway_url="https://gateway.example/completions",
+        graph_backend="sqlite",
+    ))
     app.state.manager.gateway = type("TestGateway", (), {
         "analyze": staticmethod(sample_result)
     })()
     with TestClient(app) as client:
-        response = client.post("/api/v1/analysis", data={"options": json.dumps({
-            "target_application": "Orders", "manual_stories": [{
-                "id": "US-1", "title": "Order status", "description": "Display order status",
-            }],
+        rejected_manual_input = client.post("/api/v1/analysis", data={"options": json.dumps({
+            "target_application": "Orders",
+            "manual_stories": [{"id": "US-1", "title": "Status", "description": "Display status"}],
         })})
+        assert rejected_manual_input.status_code == 422
+        response = client.post("/api/v1/analysis", data={"options": json.dumps({
+            "target_application": "Orders",
+        })}, files={"story_files": ("stories.json", json.dumps([{
+            "id": "US-1", "title": "Order status", "description": "Display order status",
+        }]).encode(), "application/json")})
         task = wait_task(client, response.json()["task_id"])
         assert task["status"] == "success", task.get("error")
         analysis = task["result"]["analysis"]

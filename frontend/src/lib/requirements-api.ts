@@ -3,14 +3,6 @@ import axios from 'axios'
 // Keep the existing API client and endpoints unchanged.
 const requirementsClient = axios.create({ baseURL: '/api/v1', timeout: 30_000 })
 
-export interface ManualStory {
-  id: string
-  title: string
-  description: string
-  acceptanceCriteria: string
-  priority: string | null
-}
-
 export interface AnalysisOptions {
   target_application: string
   analysis_mode: 'FULL' | 'INCREMENTAL' | 'UNKNOWN'
@@ -23,7 +15,6 @@ export interface AnalysisOptions {
   indexed_repo_id?: string
   focus?: string
   jira_issue_keys: string[]
-  manual_stories: ManualStory[]
 }
 
 export interface Evidence {
@@ -32,6 +23,8 @@ export interface Evidence {
   filePath: string | null
   externalId: string | null
   worksheet: string | null
+  symbol?: string | null
+  section?: string | null
   row: number | null
   lineStart: number | null
   lineEnd: number | null
@@ -48,6 +41,11 @@ export interface Requirement {
   implementationEvidenceStatus: string
   evidenceStatus: string
   validationNotes: string
+  childRequirements?: {
+    name: string
+    requirement: string
+    acceptanceCriterion: string
+  }[]
 }
 
 export interface Analysis {
@@ -73,6 +71,18 @@ export interface AnalysisTask {
   metadata?: { kind?: string; target_application?: string }
   result?: {
     analysis?: Analysis
+    canonical?: {
+      project: {
+        projectName: string
+        analysisMode: 'CODEBASE' | 'DOCUMENTS' | 'COMBINED'
+        implementationVerified: 'YES' | 'NO' | 'PARTIAL'
+      }
+      analysisSummary: {
+        parentRequirements: number
+        childRequirements: number
+        totalRequirements: number
+      }
+    }
     files_processed?: number
     files_indexed?: number
     files_analyzed?: number
@@ -159,11 +169,17 @@ export const requirementsApi = {
   },
   task: (taskId: string) => requirementsClient.get<AnalysisTask>(`/tasks/${taskId}`),
   tasks: () => requirementsClient.get<{ tasks: AnalysisTask[] }>('/tasks', {
-    params: { limit: 100, include_result: false },
+    params: { limit: 1000, include_result: false },
   }),
+  clearAnalysisHistory: () => requirementsClient.delete<{
+    deleted_count: number
+    active_count: number
+    deleted_task_ids: string[]
+  }>('/tasks/analysis-history'),
   cancel: (taskId: string) => requirementsClient.post(`/tasks/${taskId}/cancel`),
   documentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/document`,
-  businessDocumentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/business-document`,
+  qtestUrl: (taskId: string) => `/api/v1/tasks/${taskId}/qtest-xlsx`,
+  artifactsUrl: (taskId: string) => `/api/v1/tasks/${taskId}/artifacts.zip`,
   download: async (taskId: string) => (
     await requirementsClient.get<Blob>(`/tasks/${taskId}/document`, { responseType: 'blob' })
   ).data,

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "TIP frontend/backend integration",
-    "description": "Local TIP + codebase_rag API. Graph storage defaults to Kuzu; TIP_GRAPH_BACKEND=sqlite selects the explicit fallback. No Neo4j server is needed. Repository ingestion is batched locally (default 500,000 files / 5 GB); requirements analysis processes every eligible file in bounded model batches, runs up to the configured concurrent-request limit, and reports analyzed coverage. Analysis focus guides synthesis; it does not filter files. A 504 triggers smaller batches; an irreducible smallest batch is retried with capped backoff until recovery or cancellation. Parallel requests can reduce elapsed time when the gateway accepts them, but cannot prevent an upstream outage. For frontend-equivalent requirements/UML analysis, call POST /analysis; the backend loads backend/tip/prompts/system.txt, applies its AnalysisResult schema, validates Mermaid, and generates separate technical and business Word documents from the same analysis. The direct gateway request is only a connectivity smoke test, not analysis. No credentials are committed in this collection.",
+    "description": "Local TIP + codebase_rag API. Requirements analysis accepts source code, supporting evidence, or both, and publishes one consolidated DOCX, canonical JSON, and qTest XLSX. The DOCX places business-readable content first and technical evidence in marked sections. Analysis focus guides synthesis; it does not filter files. The direct gateway request is only a connectivity smoke test, not analysis. No credentials are committed in this collection.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -149,7 +149,7 @@
       "request": { "method": "GET", "url": "{{baseUrl}}/configuration" }
     },
     {
-      "name": "Analyze manual user story",
+      "name": "Analyze supporting evidence file (select local file)",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [
@@ -165,14 +165,18 @@
           "formdata": [{
             "key": "options",
             "type": "text",
-            "value": "{\"target_application\":\"Orders\",\"analysis_mode\":\"INCREMENTAL\",\"code_source\":\"uploads\",\"manual_stories\":[{\"id\":\"US-001\",\"title\":\"View order status\",\"description\":\"As a customer, I want to view the status of my order.\",\"acceptanceCriteria\":\"The order detail view displays the current status.\",\"priority\":null}]}"
+            "value": "{\"target_application\":\"Orders\",\"analysis_mode\":\"INCREMENTAL\",\"code_source\":\"uploads\"}"
+          }, {
+            "key": "story_files",
+            "type": "file",
+            "src": "/path/to/story-evidence.txt"
           }]
         }
       }
     },
     {
       "name": "Analyze uploaded code, Excel and Word (choose files first)",
-      "description": "Frontend-equivalent multipart analysis request. Select local files for code_files, requirements_files, and/or design_files. The backend supplies its own system prompt and Mermaid/AnalysisResult contract, analyzes bounded batches with configured concurrency, and generates technical and business Word documents; poll the returned taskId before downloading either document.",
+      "description": "Frontend-equivalent multipart analysis request. Select local files for code_files, requirements_files, design_files, and/or story_files. The backend analyzes bounded batches and publishes one DOCX, canonical JSON, and qTest XLSX; poll the returned taskId before downloading all three outputs.",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [
@@ -219,16 +223,16 @@
       "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}" }
     },
     {
-      "name": "Get completed structured analysis",
+      "name": "Download canonical requirements JSON",
       "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/analysis" }
     },
     {
-      "name": "Download completed Word (Send and Download)",
+      "name": "Download consolidated requirements DOCX",
       "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/document" }
     },
     {
-      "name": "Download plain-language business Word document (Send and Download)",
-      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/business-document" }
+      "name": "Download qTest requirements XLSX",
+      "request": { "method": "GET", "url": "{{baseUrl}}/tasks/{{taskId}}/qtest-xlsx" }
     },
     {
       "name": "Cancel current task",
@@ -298,7 +302,7 @@
     },
     {
       "name": "Analyze actual indexed source (requires AI gateway)",
-      "description": "Frontend-equivalent indexed analysis request. Sends AnalysisOptions to the local backend; the focus variable guides synthesis but does not select or exclude files. Every eligible indexed file is analyzed in bounded, parallel batches. Results include exact analyzed coverage and batch count; the backend validates each batch and generates separate technical and business Word documents only after all batches succeed.",
+      "description": "Frontend-equivalent indexed analysis request. Sends AnalysisOptions to the local backend; the focus variable guides synthesis but does not select or exclude files. Every eligible indexed file is analyzed in bounded, parallel batches. Results include analyzed coverage and batch count; the backend publishes one consolidated DOCX, canonical JSON, and qTest XLSX only after all batches succeed.",
       "event": [{
         "listen": "test",
         "script": { "type": "text/javascript", "exec": [

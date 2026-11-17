@@ -88,6 +88,7 @@ tip/extraction.py
 tip/gateway.py
 tip/models.py
 tip/neo4j_store.py
+tip/outputs.py
 tip/rag_routes.py
 tip/render-mermaid.mjs
 tip/service.py

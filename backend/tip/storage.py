@@ -41,7 +41,8 @@ class Store:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY, body TEXT NOT NULL, status TEXT,
-                    created_at TEXT, document BLOB, business_document BLOB
+                    created_at TEXT, document BLOB, business_document BLOB,
+                    canonical_json BLOB, qtest_xlsx BLOB
                 );
                 CREATE TABLE IF NOT EXISTS artifacts (
                     id INTEGER PRIMARY KEY, repo_id TEXT NOT NULL,
@@ -97,6 +98,8 @@ class Store:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for column, definition in (
                 ("business_document", "BLOB"),
+                ("canonical_json", "BLOB"),
+                ("qtest_xlsx", "BLOB"),
                 ("status", "TEXT"),
                 ("created_at", "TEXT"),
             ):
@@ -166,6 +169,8 @@ class Store:
     def complete(
         self, task_id: str, result: dict, document: bytes | None,
         business_document: bytes | None = None,
+        canonical_json: bytes | None = None,
+        qtest_xlsx: bytes | None = None,
     ):
         with self.lock:
             task = self.get(task_id)
@@ -179,10 +184,10 @@ class Store:
                     self._persist_analysis(db, task_id, analysis)
                 db.execute(
                     "UPDATE tasks SET body=?, status=?, created_at=?, document=?, "
-                    "business_document=? WHERE id=?",
+                    "business_document=?, canonical_json=?, qtest_xlsx=? WHERE id=?",
                     (
                         json.dumps(task), task["status"], task["created_at"],
-                        document, business_document, task_id,
+                        document, business_document, canonical_json, qtest_xlsx, task_id,
                     ),
                 )
 
@@ -283,6 +288,20 @@ class Store:
             ).fetchone()
         return row["business_document"] if row else None
 
+    def canonical_json(self, task_id: str) -> bytes | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT canonical_json FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        return row["canonical_json"] if row else None
+
+    def qtest_xlsx(self, task_id: str) -> bytes | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT qtest_xlsx FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        return row["qtest_xlsx"] if row else None
+
     def list_tasks(
         self, status: str | None = None, limit: int = 100, *,
         include_result: bool = True,
@@ -300,6 +319,40 @@ class Store:
             for task in tasks:
                 task.pop("result", None)
         return {"tasks": tasks, "total_count": total}
+
+    def clear_analysis_history(self) -> dict:
+        with self.lock, self.connect() as db:
+            rows = db.execute("SELECT id, body, status FROM tasks").fetchall()
+            task_ids = []
+            active_count = 0
+            for row in rows:
+                task = json.loads(row["body"])
+                if (task.get("metadata") or {}).get("kind") != "analysis":
+                    continue
+                if row["status"] in {"pending", "running"}:
+                    active_count += 1
+                    continue
+                task_ids.append(row["id"])
+
+            for task_id in task_ids:
+                db.execute(
+                    "DELETE FROM requirement_evidence WHERE task_id=?", (task_id,),
+                )
+                db.execute("DELETE FROM evidence WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM requirements WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM analysis_records WHERE task_id=?", (task_id,))
+                if self.knowledge:
+                    scope = f"analysis:{task_id}"
+                    db.execute("DELETE FROM rag_fts WHERE scope=?", (scope,))
+                    db.execute("DELETE FROM rag_chunks WHERE scope=?", (scope,))
+                    db.execute("DELETE FROM rag_snapshots WHERE scope=?", (scope,))
+                db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+        return {
+            "deleted_count": len(task_ids),
+            "active_count": active_count,
+            "deleted_task_ids": task_ids,
+        }
 
     def index(
         self, repo_id: str, artifacts: list[Artifact], replace: bool = True, *,

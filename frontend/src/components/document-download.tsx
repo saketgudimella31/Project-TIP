@@ -4,101 +4,56 @@ import { errorMessage, requirementsApi } from '../lib/requirements-api'
 export function DocumentDownload({
   taskId,
   automatically,
+  projectName = 'Project',
 }: {
   taskId: string
   automatically: boolean
+  projectName?: string
 }) {
   const started = useRef<string | null>(null)
   const [failure, setFailure] = useState('')
 
   useEffect(() => {
     if (!automatically || started.current === taskId) return
-
     started.current = taskId
-
-    // Automatically download only the technical document.
-    // Both documents remain available through the links below.
     requirementsApi
       .download(taskId)
       .then((document) => {
         const url = URL.createObjectURL(document)
         const link = window.document.createElement('a')
-
         link.href = url
-        link.download = `TIP-technical-requirements-${taskId}.docx`
-
+        const slug = projectName.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-|-$/g, '') || 'project'
+        link.download = `TIP-Final-Requirements-${slug}.docx`
         window.document.body.appendChild(link)
         link.click()
         link.remove()
-
-        window.setTimeout(
-          () => URL.revokeObjectURL(url),
-          1000,
-        )
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000)
       })
-      .catch((error: unknown) =>
-        setFailure(errorMessage(error)),
-      )
-  }, [automatically, taskId])
+      .catch((error: unknown) => setFailure(errorMessage(error)))
+  }, [automatically, projectName, taskId])
 
   return (
-    <div className="space-y-4">
+    <section className="space-y-3">
       {failure && (
         <p role="alert">
-          Automatic download failed: {failure}. Use the
-          download links below to retry.
+          Automatic DOCX download failed: {failure}. Use the links below to retry.
         </p>
       )}
-
-      <div>
-        <p className="font-medium">
-          Technical Requirements
-        </p>
-
-        <p className="text-sm">
-          Detailed requirements, implementation evidence,
-          traceability, and UML information.
-        </p>
-
-        <a
-          className="underline"
-          href={requirementsApi.documentUrl(taskId)}
-          download
-        >
-          Download Technical Requirements
+      <h3 className="font-semibold">Requirements generated</h3>
+      <div className="flex flex-wrap gap-4">
+        <a className="underline font-semibold" href={requirementsApi.artifactsUrl(taskId)} download>
+          Download all artifacts (ZIP)
+        </a>
+        <a className="underline" href={requirementsApi.documentUrl(taskId)} download>
+          Final requirements DOCX
+        </a>
+        <a className="underline" href={requirementsApi.analysisUrl(taskId)} download>
+          Canonical requirements JSON
+        </a>
+        <a className="underline" href={requirementsApi.qtestUrl(taskId)} download>
+          qTest requirements XLSX
         </a>
       </div>
-
-      <div>
-        <p className="font-medium">
-          Non-Technical Functional Requirements
-        </p>
-
-        <p className="text-sm">
-          Business-facing Functional Requirements
-          Specification for product, operations, management,
-          and other non-technical stakeholders.
-        </p>
-
-        <a
-          className="underline"
-          href={requirementsApi.businessDocumentUrl(taskId)}
-          download
-        >
-          Download Non-Technical FRS
-        </a>
-      </div>
-
-      <div>
-        <a
-          className="underline"
-          href={requirementsApi.analysisUrl(taskId)}
-          target="_blank"
-          rel="noreferrer"
-        >
-          Structured analysis JSON
-        </a>
-      </div>
-    </div>
+    </section>
   )
 }

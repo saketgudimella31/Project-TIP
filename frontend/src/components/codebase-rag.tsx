@@ -54,28 +54,31 @@ export function CodebaseRag({
     ingest.mutate()
   }
   return <Card>
-    <CardHeader><CardTitle>Codebase RAG &amp; dependency graph</CardTitle></CardHeader>
-    <CardContent className="space-y-5">
+    <CardHeader className="space-y-2">
+      <CardTitle className="text-primary">Codebase RAG &amp; dependency graph</CardTitle>
+      <p className="text-sm text-muted-foreground">Index and inspect an authorized source repository.</p>
+    </CardHeader>
+    <CardContent className="space-y-6">
       {config && !config.graph_configured && <p role="alert">The code graph is unavailable. Check backend configuration.</p>}
-      <form className="space-y-3" onSubmit={submitIngest}>
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="space-y-1">
+      <form className="space-y-4" onSubmit={submitIngest}>
+        <div className="grid items-start gap-4 md:grid-cols-2">
+          <div className="space-y-2">
             <Label htmlFor="rag-repo-url">Authorized HTTPS repository URL</Label>
             <Input id="rag-repo-url" type="url" required value={repoUrl}
               onChange={(event) => setRepoUrl(event.target.value)} />
           </div>
-          <div className="space-y-1">
+          <div className="space-y-2">
             <Label htmlFor="rag-branch">Branch (optional)</Label>
             <Input id="rag-branch" value={branch} onChange={(event) => setBranch(event.target.value)} />
           </div>
-          <div className="space-y-1">
+          <div className="space-y-2">
             <Label htmlFor="rag-selected-path">Selected subdirectory (optional)</Label>
             <Input id="rag-selected-path" placeholder="e.g. src/application" value={selectedPath}
               onChange={(event) => setSelectedPath(event.target.value)} />
           </div>
         </div>
         <Button type="submit" disabled={running}>Index repository</Button>
-        <p className="text-sm text-slate-600">
+        <p className="max-w-4xl text-sm leading-6 text-muted-foreground">
           Private repositories require Git credentials configured on the backend; do not put credentials in the URL.
           Repositories are indexed in local batches up to {config?.max_repository_files?.toLocaleString() ?? '100,000'} readable files
           with a per-file size cap of {((config?.max_repository_file_bytes ?? 30000000) / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB.
@@ -91,7 +94,7 @@ export function CodebaseRag({
         <p role="note">{task.data.result.files_indexed.toLocaleString()} readable files indexed locally.</p>
       )}
       {task.data?.error && <p role="alert">{task.data.error}</p>}
-      <div className="space-y-1">
+      <div className="max-w-2xl space-y-2">
         <Label htmlFor="rag-repo-id">Indexed repository ID</Label>
         <Input id="rag-repo-id" value={repoId} onChange={(event) => setRepoId(event.target.value)} />
       </div>
@@ -125,12 +128,12 @@ export function CodebaseRag({
         </details>)}
       </section>}
       <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); impact.mutate() }}>
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="space-y-1">
+        <div className="grid items-start gap-4 md:grid-cols-2">
+          <div className="space-y-2">
             <Label htmlFor="rag-file">Changed file (repository-relative path)</Label>
             <Input id="rag-file" required value={file} onChange={(event) => setFile(event.target.value)} />
           </div>
-          <div className="space-y-1">
+          <div className="space-y-2">
             <Label htmlFor="rag-depth">Impact depth (1-5)</Label>
             <Input id="rag-depth" type="number" min={1} max={5} required value={depth}
               onChange={(event) => setDepth(Number(event.target.value))} />

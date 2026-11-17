@@ -18,7 +18,7 @@ import xlrd
 from docx import Document
 
 from .config import Settings
-from .models import Artifact, ManualStory, SourceType
+from .models import Artifact, SourceType, StoryEvidence
 
 TEXT_EXTENSIONS = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt",
@@ -282,17 +282,40 @@ class Extractor:
                 lines.extend(" | ".join(cell.text for cell in row.cells) for row in table.rows)
             yield self.artifact(kind, name, "\n".join(lines))
             return
+        if kind == "DESIGN_DOCUMENT" and suffix == ".pdf":
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted:
+                raise ValueError(f"Encrypted PDF is not supported: {name}")
+            if len(reader.pages) > 1000:
+                raise ValueError(f"{name} exceeds the 1,000-page PDF limit")
+            pages = []
+            total_characters = 0
+            for page_number, page in enumerate(reader.pages, 1):
+                text = page.extract_text() or ""
+                total_characters += len(text)
+                if total_characters > self.settings.max_artifact_characters:
+                    raise ValueError(
+                        f"{name} exceeds the per-artifact character limit; select a smaller scope"
+                    )
+                if text.strip():
+                    pages.append(f"[Page {page_number}]\n{text}")
+            if not pages:
+                raise ValueError(f"No readable text in PDF: {name}")
+            yield self.artifact(kind, name, "\n".join(pages))
+            return
         if kind == "RAW_REQUIREMENT" and suffix in {".xlsx", ".xls"}:
             yield from self.workbook(name, data, suffix)
             return
         if kind == "JIRA_USER_STORY" and suffix == ".json":
             stories = json.loads(data)
             if not isinstance(stories, list) or not stories:
-                raise ValueError("Story JSON must contain a nonempty array of manual story objects")
+                raise ValueError("Story evidence JSON must contain a nonempty array")
             if len(stories) > 100:
                 raise ValueError("Story JSON is limited to 100 stories")
             for index, item in enumerate(stories):
-                yield self.story(ManualStory.model_validate(item), f"{name}#{index + 1}")
+                yield self.story(StoryEvidence.model_validate(item), f"{name}#{index + 1}")
             return
         if kind != "CODE" and suffix not in {".txt", ".md"}:
             raise ValueError(f"Unsupported {kind} file: {name}")
@@ -362,9 +385,9 @@ class Extractor:
                 "RAW_REQUIREMENT", name, content, worksheet=worksheet, row=index,
             ))
 
-    def story(self, story: ManualStory, source_name: str | None = None) -> Artifact:
+    def story(self, story: StoryEvidence, source_name: str | None = None) -> Artifact:
         return self.artifact(
-            "JIRA_USER_STORY", source_name or f"manual:{story.id}",
+            "JIRA_USER_STORY", source_name or f"story:{story.id}",
             story.model_dump_json(), externalId=story.id,
         )
 

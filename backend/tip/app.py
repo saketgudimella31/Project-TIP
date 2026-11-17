@@ -7,6 +7,7 @@ import re
 import subprocess
 import logging
 import sqlite3
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -254,7 +255,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         filename, b"", kinds[name], stream=stream, size=file_size,
                     ))
             if (
-                not uploads and not options.manual_stories and not options.jira_issue_keys
+                not uploads and not options.jira_issue_keys
                 and options.code_source == "uploads"
             ):
                 raise HTTPException(422, "NO_ANALYZABLE_INPUT: provide code or supporting evidence")
@@ -291,6 +292,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(422, "Unknown task status")
         return store.list_tasks(status, limit, include_result=include_result)
 
+    @app.delete("/api/v1/tasks/analysis-history")
+    def clear_analysis_history():
+        return store.clear_analysis_history()
+
     def require_task(task_id: str):
         task = store.get(task_id)
         if not task:
@@ -325,13 +330,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/tasks/{task_id}/analysis")
     def analysis_result(task_id: str):
         task = require_task(task_id)
-        result = task.get("result", {}).get("analysis")
-        if task["status"] != "success" or not result:
-            raise HTTPException(409, "Analysis is not successfully completed")
+        payload = store.canonical_json(task_id)
+        canonical = task.get("result", {}).get("canonical", {})
+        project_name = canonical.get("project", {}).get("projectName", "project")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", project_name).strip("-") or "project"
+        if task["status"] != "success" or payload is None:
+            raise HTTPException(409, "Canonical requirements JSON is not ready")
         return JSONResponse(
-            content=result,
+            content=json.loads(payload),
             headers={
-                "Content-Disposition": f'attachment; filename="TIP-analysis-{task_id}.json"',
+                "Content-Disposition":
+                    f'attachment; filename="TIP-Final-Requirements-{filename}.json"',
             },
         )
 
@@ -341,24 +350,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         document = store.document(task_id)
         if task["status"] != "success" or document is None:
             raise HTTPException(409, "Word document is not ready")
-        return StreamingResponse(
-            io.BytesIO(document),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="TIP-technical-requirements-{task_id}.docx"'},
-        )
-
-    @app.get("/api/v1/tasks/{task_id}/business-document")
-    def download_business_document(task_id: str):
-        task = require_task(task_id)
-        document = store.business_document(task_id)
-        if task["status"] != "success" or document is None:
-            raise HTTPException(409, "Business Word document is not ready")
+        project_name = task.get("result", {}).get("canonical", {}).get(
+            "project", {},
+        ).get("projectName", "project")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", project_name).strip("-") or "project"
         return StreamingResponse(
             io.BytesIO(document),
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
                 "Content-Disposition":
-                    f'attachment; filename="TIP-non-technical-FRS-{task_id}.docx"'
+                    f'attachment; filename="TIP-Final-Requirements-{filename}.docx"',
+            },
+        )
+
+    @app.get("/api/v1/tasks/{task_id}/qtest-xlsx")
+    def download_qtest_workbook(task_id: str):
+        task = require_task(task_id)
+        workbook = store.qtest_xlsx(task_id)
+        canonical = task.get("result", {}).get("canonical", {})
+        project_name = canonical.get("project", {}).get("projectName", "project")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", project_name).strip("-") or "project"
+        if task["status"] != "success" or workbook is None:
+            raise HTTPException(409, "qTest requirements workbook is not ready")
+        return StreamingResponse(
+            io.BytesIO(workbook),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="TIP-qTest-Requirements-{filename}.xlsx"',
+            },
+        )
+
+    @app.get("/api/v1/tasks/{task_id}/artifacts.zip")
+    def download_artifacts(task_id: str):
+        task = require_task(task_id)
+        canonical = task.get("result", {}).get("canonical", {})
+        project_name = canonical.get("project", {}).get("projectName", "project")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", project_name).strip("-") or "project"
+        document = store.document(task_id)
+        canonical_json = store.canonical_json(task_id)
+        workbook = store.qtest_xlsx(task_id)
+        if task["status"] != "success" or any(
+            artifact is None for artifact in (document, canonical_json, workbook)
+        ):
+            raise HTTPException(409, "All final artifacts are not ready")
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr(f"TIP-Final-Requirements-{filename}.docx", document)
+            output.writestr(f"TIP-Final-Requirements-{filename}.json", canonical_json)
+            output.writestr(f"TIP-qTest-Requirements-{filename}.xlsx", workbook)
+        archive.seek(0)
+        return StreamingResponse(
+            archive,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="TIP-Requirements-Artifacts-{filename}.zip"',
             },
         )
 

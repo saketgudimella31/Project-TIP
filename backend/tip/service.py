@@ -27,6 +27,13 @@ from .models import AnalysisOptions, Artifact, InputContext, SourceType, Support
 from .storage import Store, now
 from .validation import add_backend_warnings, validate_merged_result, validate_result
 from codebase_rag.services.knowledge.local_store import EmbeddingError
+from .outputs import (
+    OutputBundle,
+    canonical_json_bytes,
+    canonical_requirements,
+    create_final_document,
+    create_qtest_workbook,
+)
 
 logger = logging.getLogger(__name__)
 MIN_ADAPTIVE_CHUNK_CHARACTERS = 1_000
@@ -157,15 +164,30 @@ class TaskManager:
             with self.lock:
                 self.check(task_id)
                 self.store.update(task_id, status="running", started_at=now())
-            result, document = operation(task_id)
+            result, document = operation(task_id)   
             business_document = None
-            if isinstance(document, DocumentBundle):
+            canonical_json = None
+            qtest_xlsx = None
+            if isinstance(document, OutputBundle):
+                canonical_json = document.canonical_json
+                qtest_xlsx = document.qtest_xlsx
+                document = document.document
+            elif isinstance(document, DocumentBundle):
+                canonical_json = document.canonical_json
+                qtest_xlsx = document.qtest_xlsx
                 business_document = document.business
-                document = document.technical
+                document = document.technical   
             result["duration_ms"] = round((time.monotonic() - start) * 1000)
             with self.lock:
                 self.check(task_id)
-                self.store.complete(task_id, result, document, business_document)
+                self.store.complete(
+                    task_id,
+                    result,
+                    document,
+                    business_document,
+                    canonical_json=canonical_json,
+                    qtest_xlsx=qtest_xlsx,
+                )
         except Cancelled:
             pass
         except Exception as error:
@@ -302,7 +324,6 @@ class TaskManager:
             self.check(task_id)
             supporting_artifacts.extend(upload.artifacts(extractor))
         supporting_artifacts.extend(jira_stories(options.jira_issue_keys, self.settings, extractor))
-        supporting_artifacts.extend(extractor.story(story) for story in options.manual_stories)
         source = {
             "repository": options.repo_url, "local": options.local_path,
             "indexed": options.indexed_repo_id, "uploads": None,
@@ -730,11 +751,16 @@ class TaskManager:
         self.progress(
             task_id, 80, "Rendering UML locally and generating both Word documents",
         )
-
-        rendered_diagrams = render_generated_diagrams(result)
-        document = create_document(result, rendered_diagrams)
+        rendered_diagrams = render_generated_diagrams(result) 
+        canonical = canonical_requirements(result)
+        document = create_final_document(result, canonical, rendered_diagrams)
         business_document = create_business_document(result, rendered_diagrams)
-
+        canonical_json = canonical_json_bytes(canonical)
+        qtest_xlsx = create_qtest_workbook(canonical)
+        outputs = DocumentBundle(
+            technical=document, business=business_document,
+            canonical_json=canonical_json, qtest_xlsx=qtest_xlsx,
+        )   
         self.check(task_id)
         indexed_files = (
             self.store.index_stats(repository_id, indexed_scope_prefix)[0]
@@ -743,6 +769,7 @@ class TaskManager:
         )
         return {
             "analysis": result.model_dump(),
+            "canonical": canonical,
             "files_processed": extractor.file_count,
             "artifacts_processed": total_artifact_count,
             "files_indexed": indexed_files or code_file_count,
@@ -753,8 +780,7 @@ class TaskManager:
             "business_document_url": f"/api/v1/tasks/{task_id}/business-document",
             "json_url": f"/api/v1/tasks/{task_id}/analysis",
             "rag_scope": f"analysis:{task_id}",
-        }, DocumentBundle(technical=document, business=business_document)
-
+        },outputs
 
 def _all_artifacts(code_factory, supporting_artifacts):
     yield from code_factory()

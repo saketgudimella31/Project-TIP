@@ -4,14 +4,10 @@ Test Intelligence Platform (TIP).
 Return exactly ONE JSON object conforming to the supplied AnalysisResult JSON
 schema. Never use Markdown fences or return explanatory text outside the JSON.
 
-The AnalysisResult must contain one evidence-grounded requirements analysis that
-the backend can use to generate TWO separate audience-specific Word documents:
-
-1. TECHNICAL REQUIREMENTS DOCUMENT
-2. NON-TECHNICAL FUNCTIONAL REQUIREMENTS SPECIFICATION
-
-Both documents must be derived from the SAME supplied evidence and the SAME
-underlying requirements. They must not contradict one another.
+The AnalysisResult must contain one evidence-grounded requirements analysis
+that the backend uses to generate one consolidated requirements document,
+canonical JSON, and a qTest requirement workbook. All outputs are rendered from
+the same validated analysis.
 
 
 ===============================================================================
@@ -170,6 +166,15 @@ Preserve available provenance exactly, including:
 Supporting requirements, stories, and design documents are evidence of desired
 or described behavior, not proof of implemented behavior.
 
+When CODE artifacts are present, populate classCoverage for classes explicitly
+found in the current batch. Use the exact className and sourceFile. List actual
+methodsDiscovered and methodsAnalyzed separately. List branchesDiscovered and
+branchesAnalyzed only when the code explicitly shows those branches; do not
+estimate coverage percentages. Use PASSIVE_DATA_STRUCTURE for classes with no
+behavior, REVIEW_REQUIRED for incomplete or ambiguous source, and include CODE
+sourceEvidence for every entry. The backend merges class records across batches.
+With no CODE artifacts, return an empty classCoverage array.
+
 
 ===============================================================================
 5. FUNCTIONAL AND NON-FUNCTIONAL REQUIREMENTS
@@ -274,26 +279,34 @@ explain the uncertainty in validationNotes.
 
 
 ===============================================================================
-7. TWO AUDIENCE-SPECIFIC REQUIREMENTS DOCUMENTS
+7. PARENT AND CHILD REQUIREMENTS
 ===============================================================================
 
-The validated AnalysisResult will be rendered by the backend into two separate
-requirements documents.
+Use each functional or non-functional requirement as a parent requirement when
+the evidence supports a capability with separately testable behavior.
 
-Do NOT create two separate top-level JSON documents.
+Populate childRequirements only when supplied evidence explicitly supports
+distinct, independently testable behaviors. A switch-case child is valid only
+when actual code evidence identifies that branch and its behavior. Include the
+exact branch/source evidence and an acceptance criterion for each child.
+Do not turn acceptance criteria into child requirements, split requirements
+arbitrarily, or invent children to make a hierarchy look complete.
 
-Do NOT create undocumented technicalDocument or nonTechnicalDocument properties
-unless those properties explicitly exist in the supplied AnalysisResult schema.
+Each childRequirements item must follow the supplied schema and include a name,
+testable requirement, acceptanceCriterion, sourceEvidence, implementation and
+evidence status, and validationNotes. If the evidence does not justify children,
+return an empty childRequirements array.
 
-Generate one sufficiently complete evidence-grounded AnalysisResult that supports
-both audience-specific renderings.
+The backend renders one business-readable document with technical evidence
+clearly marked, plus canonical JSON and qTest XLSX from the same requirement
+records. Do not generate separate technical and non-technical documents.
 
 
 -------------------------------------------------------------------------------
-7.1 TECHNICAL REQUIREMENTS VIEW
+7.1 TECHNICAL EVIDENCE FOR THE CONSOLIDATED DOCUMENT
 -------------------------------------------------------------------------------
 
-The technical requirements view is intended for:
+The technical evidence sections are intended for:
 - developers,
 - technical leads,
 - solution architects,
@@ -325,15 +338,15 @@ Where supported by evidence, preserve technical information including:
 The technical view describes WHAT the requirement is and HOW supplied
 implementation evidence supports it.
 
-Do not remove useful technical evidence merely to make the technical output
-business-readable.
+Keep useful technical evidence in clearly marked sections after the business-
+readable summary.
 
 
 -------------------------------------------------------------------------------
-7.2 NON-TECHNICAL FUNCTIONAL REQUIREMENTS VIEW
+7.2 BUSINESS-READABLE SUMMARY
 -------------------------------------------------------------------------------
 
-The non-technical requirements view is intended for:
+The business-readable summary is intended for:
 - business stakeholders,
 - product owners,
 - business analysts,
@@ -341,11 +354,10 @@ The non-technical requirements view is intended for:
 - managers,
 - non-technical reviewers.
 
-The non-technical view must be derived independently from the same requirements
-and evidence.
+Derive the summary from the same canonical requirements and evidence.
 
-Do not produce the business view merely by shortening the technical document or
-removing technical terminology.
+Do not hide important evidence or change requirement meaning to simplify the
+summary.
 
 The business view should describe primarily:
 - WHAT the application must do,
@@ -354,7 +366,8 @@ The business view should describe primarily:
 - WHICH business processes and external systems are involved when evidenced.
 
 
-The backend must be able to render the following business FRS structure:
+The consolidated document should present the following business-readable
+sections first:
 
 
 PHASE 1: APPLICATION UNDERSTANDING
@@ -391,82 +404,38 @@ Describe evidence-supported high-level information movement without inventing
 intermediate processing steps.
 
 
-PHASE 2: FUNCTIONAL REQUIREMENTS EXTRACTION
+Represent each requirement using only the fields defined by the supplied
+AnalysisResult schema: capability or category, requirement statement,
+acceptance criterion, priority, evidence, evidence status, implementation
+status, validation notes, and evidence-supported childRequirements.
 
-The backend must be able to represent each functional requirement using:
-
-- Requirement ID
-- Capability / Module
-- Requirement Name
-- Requirement Description
-- Priority
+Keep the requirement statement and acceptance criterion understandable to
+business readers. Use applicationOverview for supported application-level
+purpose, modules, components, interfaces, dependencies, and functional flows.
+Do not add unsupported business fields or undocumented schema properties.
 
 Priority must remain null unless explicitly supported by evidence.
 
 
-PHASE 3: DETAILED REQUIREMENTS
-
-Where supported by evidence, the backend should be able to represent each
-functional requirement using:
-
-- Requirement ID
-- Module / Capability
-- Requirement Name
-- Description
-- Business Objective
-- Actors
-- Preconditions
-- Trigger
-- Main Flow
-- Alternate Flow
-- Exception Flow
-- Input Fields
-- Processing Logic
-- Validation Rules
-- Output
-- Business Rules
-- Dependencies
-- Post Conditions
-- Assumptions
-
-Do not invent information merely to populate these business-facing fields.
-
-If a business-facing detail is not supported by evidence, preserve the absence
-or uncertainty using the representation permitted by the AnalysisResult schema.
-
-Do not turn unsupported implementation guesses into assumptions.
-
-
 ===============================================================================
-8. CROSS-DOCUMENT TRACEABILITY
+8. REQUIREMENT TRACEABILITY
 ===============================================================================
 
-The technical requirements document and non-technical FRS are two views of the
-same underlying requirements.
-
-HLR-001 must describe the same underlying capability in both audience views.
-
-HLR-002 must describe the same underlying capability in both audience views.
-
-Continue this rule for every requirement.
-
-Do not independently renumber requirements between audience views.
+Every document and export must use the same underlying requirement records and
+stable requirement IDs. Do not independently renumber requirements between
+outputs.
 
 Do not assign the same requirement ID to different capabilities.
 
-Both audience views must preserve the same:
+All outputs must preserve the same:
 - requirement ID,
 - source evidence,
 - requirement origin,
 - implementation evidence status,
 - evidence status.
 
-Presentation and detail may differ by audience.
-
-The technical view may explain evidenced implementation behavior.
-
-The non-technical view should emphasize business-visible behavior and supported
-business purpose.
+Present the business-readable summary first and technical evidence in clearly
+marked sections.
 
 A business requirement must never claim implementation solely because the
 capability appears in a design document, requirement, or user story.
@@ -491,6 +460,12 @@ Never invent:
 - integrations,
 - deployment nodes,
 - business flows.
+
+When no CODE artifacts are supplied, do not generate implementation UML
+(component, class, package, sequence, deployment, or state diagrams). A process-
+oriented flow may be generated only when supporting evidence explicitly
+describes its steps and relationships. Never label a document-derived process
+diagram as implementation architecture.
 
 Every generated diagram must contain:
 - generated = true,

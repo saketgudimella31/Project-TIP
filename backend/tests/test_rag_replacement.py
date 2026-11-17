@@ -29,7 +29,7 @@ from tip.app import create_app
 from tip.config import Settings
 from tip.models import Artifact, InputContext
 from .fixtures import sample_result
-from .test_workflow import wait_task, workbook_bytes, docx_bytes
+from .test_workflow import TEST_PNG, wait_task, workbook_bytes, docx_bytes
 
 
 def memory(project="repo", **changes):
@@ -256,6 +256,9 @@ def synthetic_gateway_app(seen, diagram_enabled=False):
 @pytest.mark.parametrize("source_kind", ["upload", "archive", "folder", "repository", "local", "story"])
 @pytest.mark.parametrize("with_uml", [False, True])
 def test_real_http_signed_gateway_rag_to_word(tmp_path, running_server, monkeypatch, source_kind, with_uml):
+    monkeypatch.setattr("tip.app.mermaid_renderer_configured", lambda: True)
+    monkeypatch.setattr("tip.app.mermaid_renderer_issue", lambda: None)
+    monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
     seen = []
     gateway_url = running_server(synthetic_gateway_app(seen, diagram_enabled=with_uml))
     source = tmp_path / "source"
@@ -303,9 +306,9 @@ def test_real_http_signed_gateway_rag_to_word(tmp_path, running_server, monkeypa
         elif source_kind == "local":
             options.update(code_source="local", local_path=str(source))
         else:
-            options["manual_stories"] = [{
+            files = [("story_files", ("stories.json", json.dumps([{
                 "id": "US-1", "title": "Order status", "description": "Display order status.",
-            }]
+            }]).encode(), "application/json"))]
         response = client.post("/api/v1/analysis", data={"options": json.dumps(options)}, files=files)
         assert response.status_code == 202, response.text
         task = wait_task(client, response.json()["task_id"])
@@ -319,8 +322,8 @@ def test_real_http_signed_gateway_rag_to_word(tmp_path, running_server, monkeypa
         assert "attachment" in document.headers["content-disposition"]
         parsed = Document(io.BytesIO(document.content))
         paragraphs = "\n".join(paragraph.text for paragraph in parsed.paragraphs)
-        assert "High-Level Functional Requirements" in paragraphs
-        assert "Requirements-to-Source-and-Design Traceability" in paragraphs
+        assert "Parent and Child Requirements" in paragraphs
+        assert "Traceability" in paragraphs
         assert "Draft for Human Validation" in paragraphs
         assert "HLR-001" in paragraphs
         if with_uml:

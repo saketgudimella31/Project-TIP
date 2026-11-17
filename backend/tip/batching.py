@@ -107,6 +107,7 @@ class AnalysisAccumulator:
             "highLevelRequirements": OrderedDict(),
             "nonFunctionalRequirements": OrderedDict(),
         }
+        self._class_coverage: OrderedDict[str, dict] = OrderedDict()
         self._overview = {
             key: [] for key in ("modules", "components", "interfaces", "dependencies", "functionalFlows")
         }
@@ -211,6 +212,38 @@ class AnalysisAccumulator:
 
         if record["value"]["priority"] is None and requirement["priority"] is not None:
             record["value"]["priority"] = requirement["priority"]
+        children = record["value"].setdefault("childRequirements", [])
+        child_by_key = {
+            _stable_key([child["name"], child["requirement"]]): child
+            for child in children
+        }
+        for child in requirement.get("childRequirements", []):
+            child_key = _stable_key([child["name"], child["requirement"]])
+            previous_child = child_by_key.get(child_key)
+            if previous_child:
+                previous_child["sourceEvidence"] = _merge_evidence(
+                    previous_child["sourceEvidence"],
+                    child["sourceEvidence"],
+                    MAX_REQUIREMENT_EVIDENCE,
+                )
+                if (
+                    previous_child["implementationEvidenceStatus"]
+                    != child["implementationEvidenceStatus"]
+                    and "IMPLEMENTATION_NOT_EVIDENCED" in {
+                        previous_child["implementationEvidenceStatus"],
+                        child["implementationEvidenceStatus"],
+                    }
+                ):
+                    previous_child["implementationEvidenceStatus"] = (
+                        "IMPLEMENTATION_NOT_EVIDENCED"
+                    )
+                if child["validationNotes"] and child["validationNotes"] not in previous_child["validationNotes"]:
+                    previous_child["validationNotes"] = "; ".join(filter(None, (
+                        previous_child["validationNotes"], child["validationNotes"],
+                    )))[:2_000]
+            elif len(children) < 100:
+                children.append(child)
+                child_by_key[child_key] = child
         record["evidence"] = _merge_evidence(
             record["evidence"], requirement["sourceEvidence"], MAX_REQUIREMENT_EVIDENCE,
         )
@@ -257,6 +290,35 @@ class AnalysisAccumulator:
                 self._supporting_inventory.append(item)
             else:
                 self._truncated.add("supporting inventory")
+
+        for item in payload.get("classCoverage", []):
+            key = _stable_key([item["className"], item["sourceFile"]])
+            previous = self._class_coverage.get(key)
+            if previous is None:
+                if len(self._class_coverage) >= 10_000:
+                    self._truncated.add("class coverage")
+                    continue
+                self._class_coverage[key] = item
+                continue
+            for field in (
+                "methodsDiscovered", "methodsAnalyzed",
+                "branchesDiscovered", "branchesAnalyzed",
+            ):
+                previous[field] = list(dict.fromkeys([*previous[field], *item[field]]))[:500]
+            previous["sourceEvidence"] = _merge_evidence(
+                previous["sourceEvidence"], item["sourceEvidence"], 50,
+            )
+            if item["analysisStatus"] == "REVIEW_REQUIRED":
+                previous["analysisStatus"] = "REVIEW_REQUIRED"
+            elif (
+                item["analysisStatus"] == "ANALYZED"
+                and previous["analysisStatus"] == "PASSIVE_DATA_STRUCTURE"
+            ):
+                previous["analysisStatus"] = "ANALYZED"
+            if item["notes"] and item["notes"] not in previous["notes"]:
+                previous["notes"] = "; ".join(filter(None, (
+                    previous["notes"], item["notes"],
+                )))[:2_000]
 
         overview = payload["applicationOverview"]
         purpose = overview["purpose"].strip()
@@ -345,6 +407,7 @@ class AnalysisAccumulator:
         payload["inputContext"] = context.model_dump()
         payload["codebaseInventory"] = self._code_inventory
         payload["supportingArtifactInventory"] = self._supporting_inventory
+        payload["classCoverage"] = list(self._class_coverage.values())
         retained_diagram_titles = {
             item["title"]
             for item in [

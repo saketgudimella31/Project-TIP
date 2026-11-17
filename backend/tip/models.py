@@ -76,6 +76,17 @@ class Artifact(StrictModel):
     sha256: str | None = None
 
 
+class ChildRequirement(StrictModel):
+    name: str = Field(min_length=1)
+    requirement: str = Field(min_length=1)
+    acceptanceCriterion: str = ""
+    priority: str | int | None = None
+    sourceEvidence: list[Evidence] = Field(min_length=1)
+    implementationEvidenceStatus: ImplementationStatus
+    evidenceStatus: EvidenceStatus
+    validationNotes: str = ""
+
+
 class Requirement(StrictModel):
     id: str
     requirement: str = Field(min_length=1)
@@ -86,6 +97,7 @@ class Requirement(StrictModel):
     implementationEvidenceStatus: ImplementationStatus
     evidenceStatus: EvidenceStatus
     validationNotes: str
+    childRequirements: list[ChildRequirement] = Field(default_factory=list, max_length=100)
 
 
 class FunctionalRequirement(Requirement):
@@ -94,6 +106,28 @@ class FunctionalRequirement(Requirement):
 
 class NonFunctionalRequirement(Requirement):
     category: str
+
+
+class ClassCoverage(StrictModel):
+    className: str = Field(min_length=1, max_length=300)
+    sourceFile: str = Field(min_length=1, max_length=2000)
+    analysisStatus: Literal["ANALYZED", "PASSIVE_DATA_STRUCTURE", "REVIEW_REQUIRED"]
+    methodsDiscovered: list[str] = Field(default_factory=list, max_length=500)
+    methodsAnalyzed: list[str] = Field(default_factory=list, max_length=500)
+    branchesDiscovered: list[str] = Field(default_factory=list, max_length=500)
+    branchesAnalyzed: list[str] = Field(default_factory=list, max_length=500)
+    notes: str = Field(default="", max_length=2000)
+    sourceEvidence: list[Evidence] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def code_evidence_only(self):
+        if any(item.sourceType != "CODE" for item in self.sourceEvidence):
+            raise ValueError("Class coverage requires CODE evidence")
+        if not set(self.methodsAnalyzed).issubset(self.methodsDiscovered):
+            raise ValueError("Analyzed methods must be present in methodsDiscovered")
+        if not set(self.branchesAnalyzed).issubset(self.branchesDiscovered):
+            raise ValueError("Analyzed branches must be present in branchesDiscovered")
+        return self
 
 
 class Diagram(StrictModel):
@@ -227,6 +261,7 @@ class AnalysisResult(StrictModel):
     applicationOverview: Overview
     highLevelRequirements: list[FunctionalRequirement]
     nonFunctionalRequirements: list[NonFunctionalRequirement]
+    classCoverage: list[ClassCoverage] = Field(default_factory=list, max_length=10_000)
     umlDiagrams: Diagrams
     requirementsToDesignTraceability: list[Traceability]
     evidenceConflicts: list
@@ -282,7 +317,7 @@ class AnalysisResult(StrictModel):
         return normalized
 
 
-class ManualStory(StrictModel):
+class StoryEvidence(StrictModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     id: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=500)
@@ -306,7 +341,6 @@ class AnalysisOptions(StrictModel):
     jira_issue_keys: list[Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*-\d+$")]] = Field(
         default_factory=list, max_length=20
     )
-    manual_stories: list[ManualStory] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def source_selection(self):

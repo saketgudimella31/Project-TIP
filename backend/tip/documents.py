@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+import logging
 
 from docx import Document
 from docx.shared import Inches
@@ -34,6 +35,8 @@ _FLOWCHART_EDGE_LABEL = re.compile(r"(\S)\s*\|[^|\r\n]*\|\s*(?=\S)")
 class DocumentBundle:
     technical: bytes
     business: bytes
+    canonical_json: bytes | None = None
+    qtest_xlsx: bytes | None = None
 
 
 def _renderer_paths() -> tuple[Path, Path]:
@@ -266,11 +269,42 @@ def render_generated_diagrams(result: AnalysisResult) -> dict[str, bytes]:
     rendered: dict[str, bytes] = {}
 
     for reference, diagram in result.umlDiagrams.entries():
-        if diagram.generated:
-            rendered[reference] = render_diagram(diagram)
+        if not diagram.generated:
+            continue
+
+        source, members_omitted, captions_omitted = (
+            _class_diagram_render_source(diagram.mermaid)
+        )
+        if members_omitted or captions_omitted:
+            warning = (
+                "Class member details and relationship captions were omitted "
+                "where present from the rendered diagram for compatibility. "
+                "The original Mermaid source remains unchanged."
+            )
+            if warning not in result.warnings:
+                result.warnings.append(warning)
+
+        candidate = diagram.model_copy(update={"mermaid": source})
+
+        try:
+            rendered[reference] = render_diagram(candidate)
+        except ValueError as error:
+            if not str(error).startswith("Local Mermaid rendering failed"):
+                raise
+
+            safe_source, changed = _safe_mermaid_render_source(source)
+            if not changed:
+                raise
+
+            logging.getLogger(__name__).warning(
+                "Retrying diagram %s with renderer-safe Mermaid source",
+                reference,
+            )
+            rendered[reference] = render_diagram(
+                diagram.model_copy(update={"mermaid": safe_source})
+            )
 
     return rendered
-
 
 def ensure_source_component_diagram(result: AnalysisResult) -> bool:
     if any(diagram.generated for _, diagram in result.umlDiagrams.entries()):
