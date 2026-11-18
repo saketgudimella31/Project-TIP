@@ -20,6 +20,10 @@ OMITTED_LINE_CITATION_WARNING = (
     "One or more line citations fell outside the supplied artifact chunk; line numbers were "
     "omitted while retaining the source-file references."
 )
+OMITTED_SECTION_CITATION_WARNING = (
+    "One or more section citations could not be verified in the supplied artifact chunk "
+    "and were omitted. Source references were retained; affected evidence requires review."
+)
 
 
 def validate_mermaid(text: str):
@@ -268,17 +272,33 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
         raise ValueError("Model changed the target application")
 
     def check(evidence: Evidence):
-        candidates = [
+        source_candidates = [
             artifact for artifact in artifacts
+            if artifact.sourceName == evidence.sourceName
+        ]
+        candidates = [
+            artifact for artifact in source_candidates
             if artifact.sourceType == evidence.sourceType
-            and artifact.sourceName == evidence.sourceName
             and (evidence.filePath is None or artifact.filePath == evidence.filePath)
             and (evidence.externalId is None or artifact.externalId == evidence.externalId)
             and (evidence.worksheet is None or artifact.worksheet == evidence.worksheet)
             and (evidence.row is None or artifact.row == evidence.row)
         ]
         if not candidates:
-            raise ValueError(f"Model cited an unknown evidence source: {evidence.sourceName}")
+            if not source_candidates:
+                raise ValueError(
+                    f"Model cited an unknown evidence source: {evidence.sourceName}. "
+                    "This source was not supplied in the current batch."
+                )
+            fields = [
+                field for field in ("sourceType", "filePath", "externalId", "worksheet", "row")
+                if getattr(evidence, field) is not None
+            ]
+            raise ValueError(
+                f"Model citation metadata did not match a supplied artifact: {evidence.sourceName}. "
+                f"The combination of {', '.join(fields)} must match one entry in "
+                "Evidence_Source_Manifest; worksheet and row are exact, 1-based provenance."
+            )
         if evidence.lineStart is not None:
             line_end = evidence.lineEnd or evidence.lineStart
 
@@ -306,7 +326,9 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
                     if OMITTED_LINE_CITATION_WARNING not in result.warnings:
                         result.warnings.append(OMITTED_LINE_CITATION_WARNING)
         if evidence.section and not any(evidence.section in a.content for a in candidates):
-            raise ValueError("Model cited a section not present in the supplied artifact")
+            evidence.section = None
+            if OMITTED_SECTION_CITATION_WARNING not in result.warnings:
+                result.warnings.append(OMITTED_SECTION_CITATION_WARNING)
         # Symbols and evidence descriptions still require human review; matching a file
         # reference cannot prove that the claimed behavior is semantically correct.
 
@@ -321,6 +343,13 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
     for requirement in requirements:
         for evidence in requirement.sourceEvidence:
             check(evidence)
+        for child in requirement.childRequirements:
+            for evidence in child.sourceEvidence:
+                check(evidence)
+            if child.implementationEvidenceStatus in {
+                "IMPLEMENTATION_EVIDENCED", "IMPLEMENTATION_PARTIALLY_EVIDENCED",
+            } and not any(e.sourceType == "CODE" for e in child.sourceEvidence):
+                raise ValueError("Child requirement claims implementation without cited code")
         origins = {e.sourceType for e in requirement.sourceEvidence}
         if set(requirement.requirementOrigin) != origins:
             raise ValueError("Requirement origin does not match the cited evidence types")
@@ -328,6 +357,20 @@ def validate_result(result: AnalysisResult, artifacts: list[Artifact],
             "IMPLEMENTATION_EVIDENCED", "IMPLEMENTATION_PARTIALLY_EVIDENCED",
         } and "CODE" not in origins:
             raise ValueError("Requirement claims implementation without cited code")
+    for coverage in result.classCoverage:
+        for evidence in coverage.sourceEvidence:
+            check(evidence)
+        if not any(
+            artifact.sourceType == "CODE"
+            and artifact.filePath == coverage.sourceFile
+            and any(
+                evidence.sourceName == artifact.sourceName
+                and (evidence.filePath is None or evidence.filePath == artifact.filePath)
+                for evidence in coverage.sourceEvidence
+            )
+            for artifact in artifacts
+        ):
+            raise ValueError("Class coverage must cite its supplied source file")
     generated_names = set()
     for name, diagram in result.umlDiagrams.entries():
         if diagram.generated:

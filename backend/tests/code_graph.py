@@ -133,6 +133,37 @@ def test_symbols_and_call_relationships_are_persistent_and_replaced(graph):
     assert graph.symbols("repo", changed)["calls"] == []
 
 
+def test_relationship_lookup_returns_edges_touching_batch_files(graph):
+    sources = {
+        "lib.py": "def helper(): return 1\n",
+        "app.py": "from lib import helper\ndef run(): return helper()\n",
+        "main.py": "import app\n",
+        "unrelated.py": "value = 1\n",
+    }
+    graph.index("repo", sources)
+
+    result = graph.relationships_for_files("repo", {"app.py"})
+
+    assert result == {
+        "relationships": [
+            {"source": "app.py", "target": "lib.py", "line": 1, "type": "IMPORTS"},
+            {
+                "source": "app.py", "target": "lib.py", "line": 2,
+                "type": "CALLS", "caller": "app.py::run", "callee": "lib.py::helper",
+            },
+            {"source": "main.py", "target": "app.py", "line": 1, "type": "IMPORTS"},
+        ],
+        "truncated": False,
+    }
+    limited = graph.relationships_for_files("repo", {"app.py"}, limit=1)
+    assert len(limited["relationships"]) == 1
+    assert limited["truncated"] is True
+    scoped = graph.relationships_for_files(
+        "repo", {"app.py"}, path_prefix="other/",
+    )
+    assert scoped == {"relationships": [], "truncated": False}
+
+
 @pytest.mark.parametrize("backend", ["kuzu", "sqlite"])
 def test_graph_reopens_without_losing_relationships(tmp_path, backend):
     path = tmp_path / "graph"
@@ -175,6 +206,53 @@ def test_graph_failure_rolls_back_source_snapshot(tmp_path, graph, monkeypatch):
     assert [artifact.filePath for artifact in store.retrieve("repo")] == ["lib.py"]
 
 
+def test_graph_query_metrics_count_successes_and_errors_persistently(tmp_path):
+    database = tmp_path / "tip.sqlite3"
+    graph = CodeGraph(tmp_path / "graph", "sqlite")
+    store = Store(database, graph)
+    artifacts = Extractor(Settings(_env_file=None, data_dir=tmp_path)).extract(
+        "lib.py", b"def helper(): return 1",
+    )
+    artifacts += Extractor(Settings(_env_file=None, data_dir=tmp_path)).extract(
+        "app.py", b"import lib",
+    )
+    store.index("repo", artifacts)
+
+    store.impact("repo", "lib.py", 2, 20)
+    store.symbols("repo")
+    store.graph_relationships("repo", {"app.py"})
+    with pytest.raises(KeyError):
+        store.impact("repo", "missing.py", 2, 20)
+    graph.close()
+
+    metrics = Store(database).metrics()
+    assert 'graph_queries_total{operation="impact",status="success"} 1' in metrics
+    assert 'graph_queries_total{operation="impact",status="error"} 1' in metrics
+    assert 'graph_queries_total{operation="symbols",status="success"} 1' in metrics
+    assert 'graph_queries_total{operation="cross_file_relationships",status="success"} 1' in metrics
+    assert 'graph_queries_total{operation="cross_file_relationships",status="error"} 0' in metrics
+
+
+def test_graph_query_metric_is_exposed_by_metrics_endpoint(tmp_path):
+    config = Settings(_env_file=None, data_dir=tmp_path, graph_backend="sqlite")
+    app = create_app(config)
+    artifacts = Extractor(config).extract("lib.py", b"def helper(): return 1")
+    artifacts += Extractor(config).extract("app.py", b"import lib")
+    app.state.store.index("repo", artifacts)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/graph/impact", params={
+            "repoId": "repo", "file": "lib.py",
+        })
+        assert response.status_code == 200
+        metrics = client.get("/api/v1/metrics")
+        assert metrics.status_code == 200
+        assert (
+            'graph_queries_total{operation="impact",status="success"} 1'
+            in metrics.text
+        )
+
+
 @pytest.mark.parametrize("backend", ["kuzu", "sqlite"])
 def test_ingestion_search_impact_indexed_analysis_and_restart(tmp_path, backend):
     source = tmp_path / "source"
@@ -185,13 +263,16 @@ def test_ingestion_search_impact_indexed_analysis_and_restart(tmp_path, backend)
     config = Settings(
         _env_file=None, data_dir=tmp_path / "data", graph_backend=backend,
         local_source_root=source, gateway_url="https://synthetic.invalid/completions",
+        analysis_batch_files=1,
     )
     app = create_app(config)
     seen = []
+    seen_relationships = []
 
     class SyntheticGateway:
         def analyze(self, target, context, artifacts, coverage=None):
             seen.extend(artifacts)
+            seen_relationships.extend(coverage["crossFileRelationships"])
             return sample_result(target, context, artifacts)
 
     app.state.manager.gateway = SyntheticGateway()
@@ -226,6 +307,13 @@ def test_ingestion_search_impact_indexed_analysis_and_restart(tmp_path, backend)
         completed = wait_task(client, analysis.json()["task_id"])
         assert completed["status"] == "success", completed.get("error")
         assert {artifact.filePath for artifact in seen} == {"app.py", "lib.py", "main.py"}
+        assert {
+            (edge["source"], edge["target"], edge["type"], edge["crossBatch"])
+            for edge in seen_relationships
+        } >= {
+            ("app.py", "lib.py", "IMPORTS", True),
+            ("main.py", "app.py", "IMPORTS", True),
+        }
         assert client.get(f"/api/v1/tasks/{completed['task_id']}/document").status_code == 200
         for invalid in [{"depth": 0}, {"depth": 6}, {"limit": 0}, {"limit": 101}]:
             assert client.get("/api/v1/graph/impact", params={

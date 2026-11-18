@@ -415,6 +415,16 @@ class TaskManager:
         if not code_file_count and not supporting_artifacts:
             raise ValueError("NO_ANALYZABLE_INPUT: provide readable code, design, stories, or requirements")
 
+        graph_context_available = (
+            self.store.graph is not None
+            and code_file_count <= self.store.max_graph_files
+            and code_character_count <= self.store.max_graph_characters
+            and not any(
+                "Code graph indexing was skipped" in warning
+                or "Code graph indexing failed" in warning
+                for warning in index_result["warnings"]
+            )
+        )
         supporting_ids = {
             (artifact.sourceType, artifact.sourceName, artifact.externalId)
             for artifact in supporting_artifacts
@@ -502,6 +512,24 @@ class TaskManager:
 
         def analyze_batch(batch: list[Artifact]):
             batch_code = [item for item in batch if item.sourceType == "CODE"]
+            batch_paths = {
+                item.filePath or item.sourceName for item in batch_code
+            }
+            relationship_index = (
+                self.store.graph_relationships(
+                    repository_id, batch_paths, indexed_scope_prefix,
+                )
+                if repository_id and batch_paths and graph_context_available
+                else None
+            )
+            relationships = relationship_index or {
+                "relationships": [], "truncated": False,
+            }
+            for relationship in relationships["relationships"]:
+                relationship["crossBatch"] = (
+                    relationship["source"] not in batch_paths
+                    or relationship["target"] not in batch_paths
+                )
             batch_coverage = {
                 "indexedCodeFiles": code_file_count,
                 "retrievedCodeFiles": len({
@@ -509,6 +537,11 @@ class TaskManager:
                 }),
                 "retrievedCharacters": sum(len(item.content) for item in batch_code),
                 "selectionMethod": "all-file bounded batch analysis",
+                "crossFileRelationshipStatus": (
+                    "available" if relationship_index is not None else "unavailable"
+                ),
+                "crossFileRelationships": relationships["relationships"],
+                "crossFileRelationshipsTruncated": relationships["truncated"],
             }
 
             batch_context = context.model_copy(update={
@@ -599,7 +632,7 @@ class TaskManager:
                 break
 
             self.check(task_id)
-            validate_result(result, batch, context, options.target_application)
+            validate_result(result, batch, batch_context, options.target_application)
             return ("complete", (result, sum(len(item.content) for item in batch)))
 
         request_count_holder = [0]
@@ -711,6 +744,10 @@ class TaskManager:
         extraction_warnings = [
             *extractor.warnings, *index_result["warnings"], *knowledge_warnings,
         ]
+        if code_file_count and not graph_context_available:
+            extraction_warnings.append(
+                "Static cross-file relationship context was unavailable for this analysis."
+            )
         if extractor.excluded_count:
             extraction_warnings.append(
                 f"Excluded {extractor.excluded_count} sensitive, generated, or dependency paths."

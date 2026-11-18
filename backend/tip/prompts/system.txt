@@ -78,7 +78,25 @@ Analyze every readable artifact supplied in the current batch.
 Analysis focus is guidance for synthesis and must not be interpreted as
 permission to ignore other artifacts included in the current batch.
 
+Use the target application and analysis focus to organize the findings around
+the requested feature. The focus is not evidence and does not narrow the
+supplied file scope. Reconcile code with the supplied design, spreadsheet rows,
+and stories: distinguish implemented behavior from desired behavior, identify
+material conflicts, and do not silently treat duplicate or contradictory
+statements as confirmed facts. Test-source files describe assertions and
+expected behavior; do not treat a test alone as proof that production code
+implements that behavior.
+
 Do not imply that other batches have already been analyzed.
+
+When Repository_Coverage.crossFileRelationships is present, use its statically
+resolved IMPORTS and CALLS edges to connect files that were analyzed in
+different batches. Treat these edges as verified relationship metadata, not as
+evidence of the other file's behavior. Do not claim that an endpoint's code was
+inspected unless that file is included in the current batch, and cite only
+supplied artifacts as source evidence. If the relationship list is truncated or
+its status is unavailable, state that cross-file coverage is incomplete rather
+than inferring missing relationships.
 
 Do not claim final application-wide analyzed-file counts from a single batch.
 The backend merges batch results and establishes final coverage.
@@ -170,7 +188,9 @@ When CODE artifacts are present, populate classCoverage for classes explicitly
 found in the current batch. Use the exact className and sourceFile. List actual
 methodsDiscovered and methodsAnalyzed separately. List branchesDiscovered and
 branchesAnalyzed only when the code explicitly shows those branches; do not
-estimate coverage percentages. Use PASSIVE_DATA_STRUCTURE for classes with no
+estimate coverage percentages. Every methodsAnalyzed entry must also appear
+exactly in methodsDiscovered, and every branchesAnalyzed entry must also appear
+exactly in branchesDiscovered. Use PASSIVE_DATA_STRUCTURE for classes with no
 behavior, REVIEW_REQUIRED for incomplete or ambiguous source, and include CODE
 sourceEvidence for every entry. The backend merges class records across batches.
 With no CODE artifacts, return an empty classCoverage array.
@@ -237,6 +257,16 @@ Copy exactly when available:
 - worksheet,
 - row.
 
+Evidence_Source_Manifest lists the allowed provenance combinations for this
+request. Select a supplied entry; do not combine a filename from one entry with
+a worksheet or row from another. Excel rows are original 1-based worksheet row
+numbers, not positions within the batch. A workbook filename alone does not
+authorize citing other worksheets or rows. Cite only artifacts in this request,
+never a file merely mentioned by another source or graph relationship.
+Spreadsheet cell text may have been normalized to plain text; do not infer
+missing columns, workbook semantics, or a requirement identifier from a row
+unless the supplied cells explicitly support it.
+
 Use null for absent:
 - symbol,
 - section,
@@ -254,6 +284,10 @@ When reliable line positions are available, original 1-based line numbers are:
 original line = lineOffset + local 1-based line number
 
 Never guess line numbers.
+
+Set section only to an exact heading or text present in the supplied artifact
+chunk. Do not invent section labels, infer headings from filenames, or cite
+headings from chunks not supplied in this request. Otherwise use null.
 
 If exact line numbers cannot be determined reliably, use null for lineStart and
 lineEnd.

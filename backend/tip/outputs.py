@@ -1,4 +1,3 @@
-import html
 import io
 import json
 import os
@@ -12,6 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from .models import AnalysisResult
+from .text_utils import strip_html
 
 QTEST_COLUMNS = (
     "Id", "Name", "Attachments", "Status", "Type", "Description", "Priority",
@@ -347,21 +347,15 @@ def _configured_qtest_defaults() -> dict[str, str]:
     return defaults
 
 
-def _html_description(requirement: dict) -> str:
-    sections = [
-        "<p><strong>Requirement</strong></p>",
-        f"<p>{html.escape(requirement['description'])}</p>",
-    ]
+def _plain_description(requirement: dict) -> str:
+    sections = ["Requirement:", strip_html(requirement["description"])]
     criteria = requirement.get("acceptanceCriteria") or []
     if criteria:
-        sections.extend([
-            "<p><strong>Acceptance Criteria</strong></p><ul>",
-            *(f"<li>{html.escape(item)}</li>" for item in criteria),
-            "</ul>",
-        ])
+        sections.extend(["", "Acceptance Criteria:"])
+        sections.extend(f"- {strip_html(item)}" for item in criteria)
     evidence = requirement.get("evidenceReferences") or []
     if evidence:
-        sections.append("<p><strong>Evidence</strong></p><ul>")
+        sections.extend(["", "Evidence:"])
         for item in evidence:
             location = item["sourceName"]
             if item.get("sourceSymbol"):
@@ -372,9 +366,27 @@ def _html_description(requirement: dict) -> str:
                 location += f" / {item['sectionName']}"
             if item.get("startLine"):
                 location += f" → lines {item['startLine']}–{item['endLine'] or item['startLine']}"
-            sections.append(f"<li>{html.escape(location)}</li>")
-        sections.append("</ul>")
-    return "".join(sections)
+            sections.append(f"- {strip_html(location)}")
+    return "\n".join(sections)
+
+
+def _qtest_priority(value, requirement_id: str) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    allowed = {
+        "must have": "Must have",
+        "should have": "Should have",
+        "nice to have": "Nice to Have",
+    }
+    if isinstance(value, str):
+        normalized = " ".join(value.split()).casefold()
+        if normalized in allowed:
+            return allowed[normalized]
+    raise ValueError(
+        f"qTest priority for {requirement_id} is not supported: {value!r}. "
+        "Use Must have, Should have, or Nice to Have, or leave priority unspecified; "
+        "TIP will not guess a mapping."
+    )
 
 
 def create_qtest_workbook(canonical: dict) -> bytes:
@@ -413,6 +425,12 @@ def create_qtest_workbook(canonical: dict) -> bytes:
         cell.fill = PatternFill("solid", fgColor="1D4ED8")
         cell.alignment = Alignment(wrap_text=True, vertical="top")
     for requirement in canonical["requirements"]:
+        requirement_type = requirement["type"]
+        if requirement_type not in {"FUNCTIONAL", "NON_FUNCTIONAL"}:
+            raise ValueError(
+                f"Unsupported qTest requirement type for {requirement['requirementId']}: "
+                f"{requirement_type!r}."
+            )
         evidence = requirement.get("evidenceReferences") or []
         source_reference = "; ".join(dict.fromkeys(
             item.get("sourceFile") or item["sourceName"] for item in evidence
@@ -421,13 +439,13 @@ def create_qtest_workbook(canonical: dict) -> bytes:
             "Id": "",
             "Name": requirement["name"],
             "Attachments": "",
-            "Status": "Draft for Human Validation",
+            "Status": "New",
             "Type": (
-                "Functional" if requirement["type"] == "FUNCTIONAL"
-                else "Non-Functional"
+                "Functional" if requirement_type == "FUNCTIONAL"
+                else "Non-functional"
             ),
-            "Description": _html_description(requirement),
-            "Priority": requirement.get("priority"),
+            "Description": _plain_description(requirement),
+            "Priority": _qtest_priority(requirement.get("priority"), requirement["requirementId"]),
             "Target Release/Build": defaults.get("Target Release/Build", ""),
             "Assigned To": defaults.get("Assigned To", ""),
             "Application": project["projectName"],

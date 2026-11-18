@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     jira_token: SecretStr = SecretStr("")
     jira_api_version: str = "3"
     jira_acceptance_field: str = ""
+    qtest_base_url: str = ""
     # Optional existing RAG service. Its summaries select local source files;
     # they are never substituted for implementation evidence.
     rag_base_url: str = ""
@@ -71,7 +72,7 @@ class Settings(BaseSettings):
     def empty_optional_path(cls, value):
         return None if value == "" else value
 
-    @field_validator("gateway_url", "jira_base_url", "rag_base_url")
+    @field_validator("gateway_url", "jira_base_url", "rag_base_url", "qtest_base_url")
     @classmethod
     def safe_service_url(cls, value: str) -> str:
         if not value:

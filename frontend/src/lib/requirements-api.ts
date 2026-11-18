@@ -145,6 +145,13 @@ export interface Uploads {
   story_files: File[]
 }
 
+export interface QTestUploadResult {
+  success: boolean
+  message: string
+  created: { requirement_id: string; qtest_id: string }[]
+  already_uploaded: { requirement_id: string; qtest_id: string }[]
+}
+
 export function errorMessage(error: unknown): string {
   if (axios.isAxiosError<{ detail?: unknown }>(error)) {
     const detail = error.response?.data?.detail
@@ -179,6 +186,13 @@ export const requirementsApi = {
   cancel: (taskId: string) => requirementsClient.post(`/tasks/${taskId}/cancel`),
   documentUrl: (taskId: string) => `/api/v1/tasks/${taskId}/document`,
   qtestUrl: (taskId: string) => `/api/v1/tasks/${taskId}/qtest-xlsx`,
+  uploadQtest: async (taskId: string, projectId: number, moduleId: number | null, token: string) => (
+    await requirementsClient.post<QTestUploadResult>(
+      `/tasks/${taskId}/qtest-upload`,
+      { project_id: projectId, module_id: moduleId, token, confirmed: true },
+      { timeout: 0 },
+    )
+  ).data,
   artifactsUrl: (taskId: string) => `/api/v1/tasks/${taskId}/artifacts.zip`,
   download: async (taskId: string) => (
     await requirementsClient.get<Blob>(`/tasks/${taskId}/document`, { responseType: 'blob' })

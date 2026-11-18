@@ -16,12 +16,14 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
 from .documents import mermaid_renderer_configured, mermaid_renderer_issue
 from .extraction import Extractor, safe_path, source_directory
 from .gateway import Gateway, prompt_file_issue
 from .models import AnalysisOptions
+from .qtest import QTestError, upload_requirements
 from .service import TaskManager, Upload, repo_identifier
 from .storage import Store
 from .rag_routes import create_rag_router
@@ -380,6 +382,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f'attachment; filename="TIP-qTest-Requirements-{filename}.xlsx"',
             },
         )
+
+    @app.post("/api/v1/tasks/{task_id}/qtest-upload")
+    async def upload_qtest(task_id: str, request: Request):
+        task = require_task(task_id)
+        payload = store.canonical_json(task_id)
+        if task["status"] != "success" or payload is None:
+            raise HTTPException(409, "Canonical requirements are not ready")
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(400, "Invalid upload request") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Invalid upload request")
+        project_id = body.get("project_id")
+        module_id = body.get("module_id")
+        token = body.get("token")
+        if (
+            type(project_id) is not int or project_id <= 0
+            or (module_id is not None and (type(module_id) is not int or module_id <= 0))
+            or not isinstance(token, str) or not token.strip() or len(token) > 4096
+            or body.get("confirmed") is not True
+        ):
+            raise HTTPException(400, "Provide a project ID, token, and explicit confirmation")
+        token = token.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if not re.fullmatch(r"[!-~]+", token):
+            raise HTTPException(400, "Invalid qTest token")
+        try:
+            return await run_in_threadpool(
+                upload_requirements, store, config.qtest_base_url, task_id,
+                project_id, token, json.loads(payload)["requirements"], module_id,
+            )
+        except QTestError as error:
+            raise HTTPException(400, str(error)) from None
 
     @app.get("/api/v1/tasks/{task_id}/artifacts.zip")
     def download_artifacts(task_id: str):

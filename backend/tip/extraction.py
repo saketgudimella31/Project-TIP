@@ -19,6 +19,7 @@ from docx import Document
 
 from .config import Settings
 from .models import Artifact, SourceType, StoryEvidence
+from .text_utils import strip_html
 
 TEXT_EXTENSIONS = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt",
@@ -49,10 +50,11 @@ def safe_path(name: str) -> str:
     return str(path)
 
 
-def excluded(name: str) -> bool:
+def excluded(name: str, *, allow_test_dirs: bool = False) -> bool:
     path = PurePosixPath(name)
+    excluded_dirs = EXCLUDED_DIRS - ({"test", "tests", "testing"} if allow_test_dirs else set())
     return (
-        bool(set(path.parts) & EXCLUDED_DIRS)
+        bool(set(path.parts) & excluded_dirs)
         or path.name in EXCLUDED_NAMES
         or path.name.startswith(".env.")
         or path.suffix.lower() in {".pem", ".key", ".p12", ".pfx", ".jks"}
@@ -377,7 +379,7 @@ class Extractor:
             if not any(value is not None and str(value).strip() for value in values):
                 continue
             content = json.dumps(
-                {openpyxl.utils.get_column_letter(i): str(value)
+                {openpyxl.utils.get_column_letter(i): strip_html(str(value))
                  for i, value in enumerate(values, 1) if value is not None},
                 ensure_ascii=False,
             )
@@ -503,7 +505,7 @@ def selected_root(root: Path, selected_path: str | None) -> Path:
     if not selected_path:
         return root
     selected_path = safe_path(selected_path)
-    if excluded(selected_path):
+    if excluded(selected_path, allow_test_dirs=True):
         raise ValueError("Selected path is excluded from source analysis")
     selected = (root / selected_path).resolve()
     if not selected.is_relative_to(root.resolve()) or not selected.is_dir():
@@ -526,7 +528,7 @@ def source_directory(settings: Settings, *, repo_url=None, local_path=None,
     sparse_path = safe_path(selected_path) if selected_path else None
     if sparse_path == ".":
         sparse_path = None
-    if sparse_path and excluded(sparse_path):
+    if sparse_path and excluded(sparse_path, allow_test_dirs=True):
         raise ValueError("Selected path is excluded from source analysis")
     url = urlsplit(repo_url or "")
     allowed_hosts = {host.strip().lower() for host in settings.repository_hosts.split(",")}

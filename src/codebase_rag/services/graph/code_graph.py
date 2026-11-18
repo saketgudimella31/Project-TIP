@@ -364,6 +364,85 @@ class CodeGraph:
             ],
         }
 
+    def relationships_for_files(
+        self, repo_id: str, paths: set[str], *, path_prefix: str | None = None,
+        limit: int = 500,
+    ) -> dict:
+        """Return bounded static relationships touching a set of files."""
+        if not paths or limit < 1:
+            return {"relationships": [], "truncated": False}
+        ordered_paths = sorted(paths)
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("Code graph is closed")
+            if self.backend == "kuzu":
+                prefix_filter = (
+                    " AND s.path STARTS WITH $prefix AND t.path STARTS WITH $prefix"
+                    if path_prefix else ""
+                )
+                parameters = {
+                    "repo": repo_id, "paths": ordered_paths, "limit": limit + 1,
+                }
+                if path_prefix:
+                    parameters["prefix"] = path_prefix
+                imports = self._query(
+                    "MATCH (s:SourceFile)-[r:IMPORTS]->(t:SourceFile) "
+                    "WHERE s.repo_id=$repo AND t.repo_id=$repo "
+                    "AND (s.path IN $paths OR t.path IN $paths)" + prefix_filter +
+                    " RETURN s.path AS source, t.path AS target, r.line AS line, "
+                    "'IMPORTS' AS type, '' AS caller, '' AS callee "
+                    "LIMIT $limit",
+                    parameters,
+                )
+                calls = self._query(
+                    "MATCH (s:SourceFile)-[r:CALLS]->(t:SourceFile) "
+                    "WHERE s.repo_id=$repo AND t.repo_id=$repo "
+                    "AND (s.path IN $paths OR t.path IN $paths)" + prefix_filter +
+                    " RETURN s.path AS source, t.path AS target, r.line AS line, "
+                    "'CALLS' AS type, r.caller AS caller, r.callee AS callee "
+                    "LIMIT $limit",
+                    parameters,
+                )
+            else:
+                placeholders = ",".join("?" for _ in ordered_paths)
+                path_parameters = (*ordered_paths, *ordered_paths)
+                prefix_filter = (
+                    " AND substr(source,1,?)=? AND substr(target,1,?)=?"
+                    if path_prefix else ""
+                )
+                prefix_parameters = (
+                    (len(path_prefix), path_prefix, len(path_prefix), path_prefix)
+                    if path_prefix else ()
+                )
+                imports = self.connection.execute(
+                    "SELECT source, target, line, 'IMPORTS', '', '' FROM imports "
+                    f"WHERE repo_id=? AND (source IN ({placeholders}) "
+                    f"OR target IN ({placeholders}))" + prefix_filter + " LIMIT ?",
+                    (repo_id, *path_parameters, *prefix_parameters, limit + 1),
+                ).fetchall()
+                calls = self.connection.execute(
+                    "SELECT source, target, line, 'CALLS', caller, callee FROM calls "
+                    f"WHERE repo_id=? AND (source IN ({placeholders}) "
+                    f"OR target IN ({placeholders}))" + prefix_filter + " LIMIT ?",
+                    (repo_id, *path_parameters, *prefix_parameters, limit + 1),
+                ).fetchall()
+
+        rows = sorted(
+            {tuple(row) for row in [*imports, *calls]},
+            key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]),
+        )
+        return {
+            "relationships": [
+                {
+                    "source": source, "target": target, "line": line, "type": kind,
+                    **({"caller": caller} if caller else {}),
+                    **({"callee": callee} if callee else {}),
+                }
+                for source, target, line, kind, caller, callee in rows[:limit]
+            ],
+            "truncated": len(rows) > limit,
+        }
+
     def symbols(self, repo_id: str, sources: dict[str, str]) -> dict:
         with self.lock:
             self.index(repo_id, sources)

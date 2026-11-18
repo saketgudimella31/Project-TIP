@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { errorMessage, requirementsApi } from '../lib/requirements-api'
+import { errorMessage, requirementsApi, type QTestUploadResult } from '../lib/requirements-api'
 
 export function DocumentDownload({
   taskId,
@@ -12,6 +12,35 @@ export function DocumentDownload({
 }) {
   const started = useRef<string | null>(null)
   const [failure, setFailure] = useState('')
+  const tokenInput = useRef<HTMLInputElement>(null)
+  const [projectId, setProjectId] = useState('')
+  const [moduleId, setModuleId] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [uploadFailure, setUploadFailure] = useState('')
+  const [uploadResult, setUploadResult] = useState<QTestUploadResult | null>(null)
+
+  const upload = async () => {
+    const project = Number(projectId)
+    const module = moduleId ? Number(moduleId) : null
+    const token = tokenInput.current?.value.trim() || ''
+    if (!Number.isSafeInteger(project) || project <= 0 ||
+      (module !== null && (!Number.isSafeInteger(module) || module <= 0)) || !token) {
+      setUploadFailure('Enter a valid project ID, optional module ID, and your qTest token.')
+      return
+    }
+    if (!window.confirm('Create these requirements in qTest? Parent and child requirements will be separate records.')) return
+    if (tokenInput.current) tokenInput.current.value = ''
+    setUploading(true)
+    setUploadFailure('')
+    setUploadResult(null)
+    try {
+      setUploadResult(await requirementsApi.uploadQtest(taskId, project, module, token))
+    } catch (error: unknown) {
+      setUploadFailure(`${errorMessage(error)}. If the connection was interrupted, check qTest before retrying.`)
+    } finally {
+      setUploading(false)
+    }
+  }
 
   useEffect(() => {
     if (!automatically || started.current === taskId) return
@@ -54,6 +83,32 @@ export function DocumentDownload({
           qTest requirements XLSX
         </a>
       </div>
+      <details className="rounded border p-4">
+        <summary className="cursor-pointer font-semibold">Upload requirements to qTest</summary>
+        <p className="mt-2 text-sm">Your administrator must configure the qTest server. Your token is used only for this upload and is not saved.</p>
+        <div className="mt-3 flex flex-wrap items-end gap-3">
+          <label className="grid gap-1 text-sm">Project ID
+            <input className="rounded border p-2" inputMode="numeric" value={projectId} onChange={(event) => setProjectId(event.target.value)} />
+          </label>
+          <label className="grid gap-1 text-sm">Module ID (optional)
+            <input className="rounded border p-2" inputMode="numeric" value={moduleId} onChange={(event) => setModuleId(event.target.value)} />
+          </label>
+          <label className="grid gap-1 text-sm">Your qTest token
+            <input ref={tokenInput} className="rounded border p-2" type="password" autoComplete="off" />
+          </label>
+          <button type="button" className="rounded border px-3 py-2" disabled={uploading} onClick={upload}>
+            {uploading ? 'Uploading...' : 'Upload to qTest'}
+          </button>
+        </div>
+        {uploadFailure && <p role="alert" className="mt-3">{uploadFailure}</p>}
+        {uploadResult && (
+          <div className="mt-3 text-sm" role={uploadResult.success ? 'status' : 'alert'}>
+            <p>{uploadResult.message}</p>
+            {uploadResult.created.length > 0 && <p>Created: {uploadResult.created.map((item) => `${item.requirement_id} → ${item.qtest_id}`).join(', ')}</p>}
+            {uploadResult.already_uploaded.length > 0 && <p>Previously uploaded: {uploadResult.already_uploaded.map((item) => `${item.requirement_id} → ${item.qtest_id}`).join(', ')}</p>}
+          </div>
+        )}
+      </details>
     </section>
   )
 }
