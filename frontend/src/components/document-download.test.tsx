@@ -1,4 +1,5 @@
 import {
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -18,6 +19,7 @@ import { DocumentDownload } from './document-download'
 vi.mock('../lib/requirements-api', () => ({
   requirementsApi: {
     download: vi.fn(),
+    uploadQtest: vi.fn(),
 
     documentUrl: (id: string) =>
       `/api/v1/tasks/${id}/document`,
@@ -50,6 +52,28 @@ it(
     ).mockResolvedValue(
       new Blob(['word']),
     )
+
+    it('requires confirmation and clears the token before reporting a partial upload', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+      vi.mocked(requirementsApi.uploadQtest).mockResolvedValue({
+        success: false,
+        message: 'The second upload is uncertain.',
+        created: [{ requirement_id: 'REQ-1', qtest_id: '25' }],
+        already_uploaded: [],
+      })
+      render(<DocumentDownload taskId="task-1" automatically={false} />)
+      fireEvent.click(screen.getByText('Upload requirements to qTest'))
+      fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: '7' } })
+      fireEvent.change(screen.getByLabelText('Your qTest token'), { target: { value: 'private-token' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Upload to qTest' }))
+      expect(requirementsApi.uploadQtest).not.toHaveBeenCalled()
+      fireEvent.click(screen.getByRole('button', { name: 'Upload to qTest' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent('The second upload is uncertain.')
+      expect(screen.getByRole('alert')).toHaveTextContent('REQ-1 → 25')
+      expect(screen.getByLabelText('Your qTest token')).toHaveValue('')
+      expect(requirementsApi.uploadQtest).toHaveBeenCalledWith('task-1', 7, null, 'private-token')
+      vi.restoreAllMocks()
+    })
 
     const create = vi.fn(
       () => 'blob:test-document',

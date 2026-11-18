@@ -8,7 +8,7 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .models import Artifact
 from codebase_rag.services.graph.code_graph import CodeGraph
@@ -90,6 +90,17 @@ class Store:
                         REFERENCES requirements(task_id, requirement_id),
                     FOREIGN KEY (task_id, evidence_id)
                         REFERENCES evidence(task_id, evidence_id)
+                );
+                CREATE TABLE IF NOT EXISTS graph_query_counts (
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (operation, status)
+                );
+                CREATE TABLE IF NOT EXISTS qtest_uploads (
+                    task_id TEXT NOT NULL, server TEXT NOT NULL, project_id INTEGER NOT NULL,
+                    requirement_id TEXT NOT NULL, state TEXT NOT NULL, remote_id TEXT,
+                    PRIMARY KEY (task_id, server, project_id, requirement_id)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS source_fts USING fts5(
                     content, path, repo_id UNINDEXED, artifact_id UNINDEXED
@@ -597,6 +608,25 @@ class Store:
         ).fetchall()
         return {row["ref"]: json.loads(row["artifact"])["content"] for row in rows}
 
+    def _record_graph_query(self, operation: str, status: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO graph_query_counts(operation, status, count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(operation, status)
+                   DO UPDATE SET count=count+1""",
+                (operation, status),
+            )
+
+    def _run_graph_query(self, operation: str, query: Callable[[], Any]) -> Any:
+        try:
+            result = query()
+        except Exception:
+            self._record_graph_query(operation, "error")
+            raise
+        self._record_graph_query(operation, "success")
+        return result
+
     def impact(self, repo_id: str, file: str, depth: int, limit: int) -> dict:
         if self.graph is None:
             raise RuntimeError("Code graph is not configured")
@@ -608,16 +638,25 @@ class Store:
             raise RuntimeError(
                 "Code graph queries are disabled above the configured file or character limit"
             )
-        with self.lock, self.connect() as db:
-            return self.graph.impact(repo_id, file, self._sources(db, repo_id), depth, limit)
+
+        def query():
+            with self.lock, self.connect() as db:
+                return self.graph.impact(
+                    repo_id, file, self._sources(db, repo_id), depth, limit,
+                )
+
+        return self._run_graph_query("impact", query)
 
     def graph_relationships(
         self, repo_id: str, paths: set[str], path_prefix: str | None = None,
     ) -> dict | None:
         if self.graph is None:
             return None
-        return self.graph.relationships_for_files(
-            repo_id, paths, path_prefix=path_prefix,
+        return self._run_graph_query(
+            "cross_file_relationships",
+            lambda: self.graph.relationships_for_files(
+                repo_id, paths, path_prefix=path_prefix,
+            ),
         )
 
     def symbols(self, repo_id: str) -> dict:
@@ -631,8 +670,12 @@ class Store:
             raise RuntimeError(
                 "Code graph queries are disabled above the configured file or character limit"
             )
-        with self.lock, self.connect() as db:
-            return self.graph.symbols(repo_id, self._sources(db, repo_id))
+
+        def query():
+            with self.lock, self.connect() as db:
+                return self.graph.symbols(repo_id, self._sources(db, repo_id))
+
+        return self._run_graph_query("symbols", query)
 
     def rag_retrieve(self, repo_id: str, query: str = "", mode: str = "hybrid",
                      limit: int = 500, path_prefix: str | None = None) -> list[Artifact]:
@@ -735,11 +778,24 @@ class Store:
             files = db.execute("SELECT count(*) FROM artifacts").fetchone()[0]
             analyses = db.execute("SELECT count(*) FROM analysis_records").fetchone()[0]
             requirements = db.execute("SELECT count(*) FROM requirements").fetchone()[0]
+            graph_queries = {
+                (row["operation"], row["status"]): row["count"]
+                for row in db.execute(
+                    "SELECT operation, status, count FROM graph_query_counts"
+                )
+            }
         lines = ["# TYPE tip_tasks gauge"]
         lines.extend(f'tip_tasks{{status="{row["status"]}"}} {row["n"]}' for row in tasks)
         lines.extend([
             "# TYPE tip_indexed_files gauge", f"tip_indexed_files {files}",
             "# TYPE tip_saved_analyses gauge", f"tip_saved_analyses {analyses}",
             "# TYPE tip_saved_requirements gauge", f"tip_saved_requirements {requirements}",
+            "# TYPE graph_queries_total counter",
         ])
+        for operation in ("impact", "symbols", "cross_file_relationships"):
+            for status in ("success", "error"):
+                count = graph_queries.get((operation, status), 0)
+                lines.append(
+                    f'graph_queries_total{{operation="{operation}",status="{status}"}} {count}'
+                )
         return "\n".join(lines) + "\n"

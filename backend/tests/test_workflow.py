@@ -32,10 +32,10 @@ from tip.documents import (
     render_diagram,
     render_generated_diagrams,
 )
-from tip.extraction import Extractor, jira_stories, source_directory
+from tip.extraction import Extractor, jira_stories, selected_root, source_directory
 from tip.gateway import CLASS_COVERAGE_WARNING, Gateway, GatewayError, model_body, signed_headers
 from tip.models import (
-    AnalysisOptions, ChildRequirement, ClassCoverage, InputContext, StoryEvidence,
+    AnalysisOptions, Artifact, ChildRequirement, ClassCoverage, InputContext, StoryEvidence,
     SupportingInputs,
 )
 from tip.outputs import (
@@ -321,6 +321,41 @@ def test_qtest_export_supports_custom_field_headers_and_defaults(tmp_path, monke
     assert workbook["Requirements"]["N2"].value == "Sprint 1"
 
 
+@pytest.mark.parametrize("priority, expected", [
+    ("Must have", "Must have"),
+    (" SHOULD  HAVE ", "Should have"),
+    ("nice to have", "Nice to Have"),
+    (None, None),
+])
+def test_qtest_export_uses_exact_import_values_for_each_requirement(tmp_path, priority, expected):
+    artifact = Extractor(settings(tmp_path)).extract(
+        "requirements.txt", b"The system shall display order status.", "RAW_REQUIREMENT",
+    )
+    canonical = canonical_requirements(sample_result("Orders", input_context(), artifact))
+    functional = canonical["requirements"][0]
+    functional["priority"] = priority
+    nonfunctional = {**functional, "requirementId": "NFR-001", "type": "NON_FUNCTIONAL"}
+    canonical["requirements"].append(nonfunctional)
+
+    workbook = openpyxl.load_workbook(io.BytesIO(create_qtest_workbook(canonical)))
+    rows = list(workbook["Requirements"].iter_rows(values_only=True))
+    assert [row[3] for row in rows[1:]] == ["New", "New"]
+    assert [row[4] for row in rows[1:]] == ["Functional", "Non-functional"]
+    assert [row[6] for row in rows[1:]] == [expected, expected]
+    assert workbook["Cover Page"]["B6"].value == "Draft for Human Validation"
+
+
+@pytest.mark.parametrize("priority", ["High", "P1", 1])
+def test_qtest_export_rejects_unmapped_priority_without_guessing(tmp_path, priority):
+    artifact = Extractor(settings(tmp_path)).extract(
+        "requirements.txt", b"The system shall display order status.", "RAW_REQUIREMENT",
+    )
+    canonical = canonical_requirements(sample_result("Orders", input_context(), artifact))
+    canonical["requirements"][0]["priority"] = priority
+    with pytest.raises(ValueError, match="qTest priority for HLR-001 is not supported"):
+        create_qtest_workbook(canonical)
+
+
 def workbook_bytes():
     workbook = openpyxl.Workbook()
     sheet = workbook.active
@@ -382,6 +417,31 @@ def test_office_extraction_preserves_provenance(tmp_path):
     designs = extractor.extract("design.docx", docx_bytes(), "DESIGN_DOCUMENT")
     assert "Orders design" in designs[0].content
     assert "Capability | Display order status" in designs[0].content
+
+
+def test_xlsx_html_cell_text_is_stripped_and_qtest_description_is_plain_text(tmp_path):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Orders"
+    sheet.append(["ID", "Requirement"])
+    sheet.append(["REQ-1", "<p>The system shall <strong>display</strong> status &amp; details.</p>"])
+    stream = io.BytesIO()
+    workbook.save(stream)
+    workbook.close()
+    artifacts = Extractor(settings(tmp_path)).extract(
+        "requirements.xlsx", stream.getvalue(), "RAW_REQUIREMENT",
+    )
+    cells = json.loads(artifacts[1].content)
+    assert cells["B"] == "The system shall display status & details."
+
+    canonical = canonical_requirements(
+        sample_result("Orders", input_context(), artifacts[1:]),
+    )
+    output = openpyxl.load_workbook(io.BytesIO(create_qtest_workbook(canonical)))
+    description = output["Requirements"]["F2"].value
+    assert "<" not in description
+    assert ">" not in description
+    assert "Requirement:\n" in description
 
 
 def test_pdf_extraction_preserves_page_provenance(tmp_path):
@@ -883,9 +943,144 @@ def test_gateway_does_not_hide_invalid_coverage_data(tmp_path, monkeypatch):
     }]
     gateway = Gateway(settings(tmp_path))
     monkeypatch.setattr(gateway, "_send", lambda body: raw)
-    with pytest.raises(ValidationError):
+    with pytest.raises(GatewayError, match="after two correction attempts"):
         gateway.analyze("Orders", input_context(), artifacts)
     gateway.close()
+
+
+@pytest.mark.parametrize("invalid_field, invalid_value", [
+    ("sourceName", "not-supplied.xlsx"),
+    ("worksheet", "Invented worksheet"),
+    ("row", 999),
+    ("filePath", "invented/path.xlsx"),
+])
+def test_gateway_corrects_excel_citations_using_same_batch(
+    tmp_path, monkeypatch, invalid_field, invalid_value,
+):
+    config = settings(tmp_path)
+    artifacts = Extractor(config).extract(
+        "requirements.xlsx", workbook_bytes(), "RAW_REQUIREMENT",
+    )[1:]
+    context = input_context(supportingInputs=SupportingInputs(
+        designDocumentsProvided=False, jiraUserStoriesProvided=False,
+        rawRequirementsProvided=True,
+    ))
+    valid = sample_result("Orders", context, artifacts).model_dump()
+    invalid = json.loads(json.dumps(valid))
+    invalid["highLevelRequirements"][0]["sourceEvidence"][0][invalid_field] = invalid_value
+    requests = []
+
+    def send(body):
+        requests.append(json.loads(body))
+        return invalid if len(requests) == 1 else valid
+
+    gateway = Gateway(config)
+    monkeypatch.setattr(gateway, "_send", send)
+    try:
+        result = gateway.analyze("Orders", context, artifacts)
+    finally:
+        gateway.close()
+
+    assert len(requests) == 2
+    payload = json.loads(requests[0]["messages"][1]["content"].split("\n", 1)[1])
+    assert payload["Evidence_Source_Manifest"] == [{
+        "sourceType": "RAW_REQUIREMENT", "sourceName": "requirements.xlsx",
+        "filePath": None, "externalId": None, "worksheet": "Orders", "row": 2,
+    }]
+    assert requests[0]["messages"][1]["content"] in requests[1]["messages"][1]["content"]
+    assert "previous response failed backend validation" in requests[1]["messages"][1]["content"]
+    evidence = result.highLevelRequirements[0].sourceEvidence[0]
+    assert evidence.sourceName == "requirements.xlsx"
+    assert evidence.worksheet == "Orders"
+    assert evidence.row == 2
+    assert any("regenerated a model batch" in warning for warning in result.warnings)
+
+
+def test_gateway_rejects_repeated_unknown_citations_after_bounded_corrections(tmp_path, monkeypatch):
+    artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"pass")
+    raw = sample_result("Orders", input_context(), artifacts).model_dump()
+    raw["highLevelRequirements"][0]["sourceEvidence"][0]["sourceName"] = "missing.xlsx"
+    calls = []
+
+    def send(body):
+        calls.append(body)
+        return json.loads(json.dumps(raw))
+
+    gateway = Gateway(settings(tmp_path))
+    monkeypatch.setattr(gateway, "_send", send)
+    try:
+        with pytest.raises(GatewayError, match="after two correction attempts.*missing.xlsx"):
+            gateway.analyze("Orders", input_context(), artifacts)
+    finally:
+        gateway.close()
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("keeps_inventing", [False, True])
+def test_excel_analysis_correction_publishes_only_validated_reports(
+    tmp_path, monkeypatch, keeps_inventing,
+):
+    app = create_app(settings(
+        tmp_path, gateway_url="https://synthetic.example/completions",
+        graph_backend="sqlite",
+    ))
+    calls = []
+
+    def send(body):
+        request = json.loads(body)
+        # Correction feedback precedes the original JSON payload on retries.
+        original_content = request["messages"][1]["content"]
+        original_content = original_content[original_content.index('{"Target_Application"'):]
+        payload = json.loads(original_content)
+        artifacts = [Artifact.model_validate(item) for item in payload["Raw_Requirements_Data"]]
+        context = InputContext.model_validate(payload["Input_Context"])
+        result = sample_result("Orders", context, artifacts).model_dump()
+        calls.append(body)
+        if keeps_inventing or len(calls) == 1:
+            result["highLevelRequirements"][0]["sourceEvidence"][0]["worksheet"] = "Not supplied"
+        return result
+
+    monkeypatch.setattr(app.state.manager.gateway, "_send", send)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": json.dumps({"target_application": "Orders"})},
+            files={"requirements_files": (
+                "requirements.xlsx", workbook_bytes(), "application/octet-stream",
+            )},
+        )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["task_id"]
+        task = wait_task(client, task_id)
+        document = client.get(f"/api/v1/tasks/{task_id}/document")
+        if keeps_inventing:
+            assert task["status"] == "failed"
+            assert "after two correction attempts" in task["error"]
+            assert len(calls) == 3
+            assert document.status_code == 409
+        else:
+            assert task["status"] == "success", task.get("error")
+            assert len(calls) == 2
+            assert document.status_code == 200
+            assert zipfile.is_zipfile(io.BytesIO(document.content))
+            assert any(
+                "regenerated a model batch" in warning
+                for warning in task["result"]["analysis"]["warnings"]
+            )
+
+
+def test_child_requirement_cannot_bypass_evidence_validation(tmp_path):
+    artifacts = Extractor(settings(tmp_path)).extract("orders.py", b"pass")
+    result = sample_result("Orders", input_context(), artifacts)
+    evidence = result.highLevelRequirements[0].sourceEvidence[0].model_copy(
+        update={"sourceName": "missing.xlsx"},
+    )
+    result.highLevelRequirements[0].childRequirements = [ChildRequirement(
+        name="Status", requirement="Display status", sourceEvidence=[evidence],
+        implementationEvidenceStatus="IMPLEMENTATION_EVIDENCED", evidenceStatus="VERIFIED",
+    )]
+    with pytest.raises(ValueError, match="unknown evidence source"):
+        validate_result(result, artifacts, input_context(), "Orders")
 
 
 def test_class_coverage_rejects_unknown_source_file(tmp_path):
@@ -1396,6 +1591,21 @@ def test_repository_subdirectory_uses_blobless_sparse_checkout(tmp_path, monkeyp
     )
 
 
+def test_explicit_test_directory_selection_is_allowed_without_weakening_hard_exclusions(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source"
+    selected = source / "src" / "test" / "java"
+    selected.mkdir(parents=True)
+    monkeypatch.setattr("tip.extraction.EXCLUDED_DIRS", {"test", "node_modules", ".git"})
+
+    assert selected_root(source, "src/test/java") == selected
+    with pytest.raises(ValueError, match="excluded"):
+        selected_root(source, "src/test/node_modules")
+    with pytest.raises(ValueError, match="excluded"):
+        selected_root(source, "src/test/.git")
+
+
 def test_full_analysis_upload_poll_download_and_reload(tmp_path, monkeypatch):
     app = create_app(settings(
         tmp_path, gateway_url="https://gateway.example/completions",
@@ -1529,6 +1739,54 @@ def test_browser_upload_limit_is_enforced_without_queuing(tmp_path):
         assert response.status_code == 413
         assert "configured size limit" in response.json()["detail"]
         assert client.get("/api/v1/tasks").json()["total_count"] == 0
+
+
+@pytest.mark.parametrize("alter_context", [False, True])
+def test_batch_context_validation_with_mixed_inputs(tmp_path, monkeypatch, alter_context):
+    app = create_app(settings(
+        tmp_path, gateway_url="https://gateway.example/completions",
+        graph_backend="sqlite", analysis_batch_files=1,
+    ))
+    monkeypatch.setattr("tip.app.mermaid_renderer_issue", lambda: None)
+    monkeypatch.setattr("tip.documents.render_diagram", lambda _: TEST_PNG)
+    seen = []
+
+    class TestGateway:
+        def analyze(self, target, context, artifacts, coverage=None):
+            seen.append((artifacts[0].sourceType, context.supportingInputs.model_dump()))
+            result = sample_result(target, context, artifacts)
+            if alter_context and artifacts[0].sourceType == "CODE":
+                result.inputContext.supportingInputs.rawRequirementsProvided = True
+            return result
+
+    app.state.manager.gateway = TestGateway()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analysis",
+            data={"options": json.dumps({"target_application": "Orders"})},
+            files=[
+                ("code_files", ("orders.py", b"def order_status(): return 'ready'", "text/plain")),
+                ("requirements_files", ("requirements.txt", b"Show order status.", "text/plain")),
+            ],
+        )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["task_id"]
+        task = wait_task(client, task_id)
+        if alter_context:
+            assert task["status"] == "failed"
+            assert "Model changed the supplied analysis scope or input context" in task["error"]
+            assert client.get(f"/api/v1/tasks/{task_id}/document").status_code == 409
+        else:
+            assert task["status"] == "success", task.get("error")
+            by_type = dict(seen)
+            assert by_type["CODE"]["rawRequirementsProvided"] is False
+            assert by_type["RAW_REQUIREMENT"]["rawRequirementsProvided"] is True
+            analysis = task["result"]["analysis"]
+            assert analysis["inputContext"]["supportingInputs"]["rawRequirementsProvided"] is True
+            assert analysis["analysisScope"]["analyzedCodeFiles"] == 1
+            assert analysis["analysisScope"]["analyzedSupportingArtifacts"] == 1
+            assert client.get(f"/api/v1/tasks/{task_id}/document").status_code == 200
+
 
 def test_large_repository_analysis_batches_every_eligible_file(tmp_path):
     source_root = tmp_path / "allowed"

@@ -327,22 +327,30 @@ export function RequirementsPanel({
                     value={options.selected_path ?? ''} onChange={(e) => setOptions({ ...options, selected_path: e.target.value || undefined })} />
                 </div>
                 <div className="space-y-2 md:col-span-2">
-                  <Label htmlFor="analysis-focus">Analysis focus (recommended for large repositories)</Label>
+                  <Label htmlFor="analysis-focus">What should the analysis prioritize? (optional)</Label>
                   <Input id="analysis-focus" maxLength={2000}
-                    placeholder="e.g. order status, authentication, payment flows"
+                    placeholder="e.g. daily debit rejection flow, validation rules, error handling"
                     value={options.focus ?? ''}
                     onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
+                  <p className="text-sm text-muted-foreground">
+                    Add a feature, workflow, or business question to guide the analysis. This does not filter files:
+                    all readable files in the selected scope are still analyzed.
+                  </p>
                 </div>
               </div>}
               {codeSource === 'local' && <div className="space-y-2">
                 <Label htmlFor="local-path">Server path inside the configured allowed root</Label>
                 <Input id="local-path" required value={options.local_path ?? ''}
                   onChange={(e) => setOptions({ ...options, local_path: e.target.value })} />
-                <Label htmlFor="local-analysis-focus">Analysis focus (recommended for large directories)</Label>
+                <Label htmlFor="local-analysis-focus">What should the analysis prioritize? (optional)</Label>
                 <Input id="local-analysis-focus" maxLength={2000}
-                  placeholder="e.g. order status, authentication, payment flows"
+                  placeholder="e.g. daily debit rejection flow, validation rules, error handling"
                   value={options.focus ?? ''}
                   onChange={(e) => setOptions({ ...options, focus: e.target.value || undefined })} />
+                <p className="text-sm text-muted-foreground">
+                  Use a feature, workflow, or business question as guidance. All readable files in the selected
+                  directory are still analyzed.
+                </p>
               </div>}
             </CardContent>
           </Card>
@@ -355,7 +363,7 @@ export function RequirementsPanel({
                   formats="DOCX, PDF, TXT, MD" accept=".docx,.pdf,.txt,.md" icon={FileText}
                   files={uploads.design_files}
                   onChange={(files) => setUploads({ ...uploads, design_files: files })} />
-                <FileUpload id="requirements-files" title="Requirements" action="Upload Excel"
+                <FileUpload id="requirements-files" title="Requirements spreadsheet" action="Upload Excel"
                   compact
                   formats="XLSX, XLS" accept=".xlsx,.xls" icon={Sheet}
                   files={uploads.requirements_files}

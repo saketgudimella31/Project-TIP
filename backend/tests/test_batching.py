@@ -1,11 +1,14 @@
 import hashlib
 
+import pytest
+
 from tip.batching import AnalysisAccumulator, iter_artifact_batches
 from tip.models import Artifact, InputContext, SupportingInputs
 from tip.validation import (
     CHUNK_RELATIVE_CITATION_WARNING,
     INVALID_DIAGRAM_WARNING,
     OMITTED_LINE_CITATION_WARNING,
+    OMITTED_SECTION_CITATION_WARNING,
     validate_merged_result,
     validate_result,
 )
@@ -190,3 +193,42 @@ def test_validation_omits_unverifiable_line_citation_without_failing():
     assert evidence.lineStart is None
     assert evidence.lineEnd is None
     assert OMITTED_LINE_CITATION_WARNING in result.warnings
+
+
+@pytest.mark.parametrize("section, expected", [
+    ("def order_status", "def order_status"),
+    ("3.2 Order processing", None),
+])
+def test_validation_handles_section_citations_without_inventing_headings(section, expected):
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    result = sample_result("Orders", analysis_context, [source])
+    requirement = result.highLevelRequirements[0]
+    requirement.sourceEvidence[0].section = section
+    original_description = requirement.sourceEvidence[0].evidenceDescription
+
+    validate_result(result, [source], analysis_context, "Orders")
+
+    assert requirement.sourceEvidence[0].section == expected
+    assert requirement.sourceEvidence[0].filePath == source.filePath
+    assert requirement.sourceEvidence[0].evidenceDescription == original_description
+    assert result.requirementsToDesignTraceability[0].sourceEvidence == requirement.sourceEvidence
+    assert (OMITTED_SECTION_CITATION_WARNING in result.warnings) == (expected is None)
+    accumulator = AnalysisAccumulator()
+    accumulator.add(result)
+    merged = accumulator.finish(
+        analysis_context, expected_code_files=1, expected_supporting_artifacts=0,
+    )
+    assert (OMITTED_SECTION_CITATION_WARNING in merged.warnings) == (expected is None)
+
+
+def test_unverifiable_section_does_not_allow_unknown_evidence_source():
+    analysis_context = context()
+    source = artifact("src/orders.py", "def order_status(): return 'ready'\n")
+    result = sample_result("Orders", analysis_context, [source])
+    evidence = result.highLevelRequirements[0].sourceEvidence[0]
+    evidence.sourceName = "missing.docx"
+    evidence.section = "3.2 Order processing"
+
+    with pytest.raises(ValueError, match="unknown evidence source"):
+        validate_result(result, [source], analysis_context, "Orders")

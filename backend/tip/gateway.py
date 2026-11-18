@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import math
 import re
 import time
@@ -12,9 +13,13 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from .config import Settings
 from .models import AnalysisResult, Artifact, InputContext
+from .validation import validate_result
+
+logger = logging.getLogger(__name__)
 PROMPTS = Path(__file__).with_name("prompts")
 QUOTA_EXHAUSTED_CODES = frozenset({
     "billing_hard_limit_reached",
@@ -166,6 +171,12 @@ def model_body(target: str, context: InputContext, artifacts: list[Artifact],
         "Target_Application": target,
         "Input_Context": context.model_dump(),
         **evidence,
+        "Evidence_Source_Manifest": [
+            artifact.model_dump(include={
+                "sourceType", "sourceName", "filePath", "externalId", "worksheet", "row",
+            })
+            for artifact in artifacts
+        ],
     }
     if coverage:
         payload["Repository_Coverage"] = coverage
@@ -336,25 +347,59 @@ class Gateway:
         artifacts: list[Artifact],
         coverage: dict | None = None,
     ) -> AnalysisResult:
-        result = self._send(
-            model_body(
-                target,
-                context,
-                artifacts,
-                self.settings,
-                coverage,
-            )
-        )
-
-        if result.get("status") == "ERROR":
-            raise GatewayError(
-                "Model reported an analysis error; "
-                "no result was published"
-            )
-
-        result = normalize_model_result(result)
-
-        return AnalysisResult.model_validate(result)
+        body = model_body(target, context, artifacts, self.settings, coverage)
+        original_request = json.loads(body)
+        for attempt in range(3):
+            result = self._send(body)
+            if result.get("status") == "ERROR":
+                raise GatewayError(
+                    "Model reported an analysis error; no result was published"
+                )
+            try:
+                analysis = AnalysisResult.model_validate(normalize_model_result(result))
+                validate_result(analysis, artifacts, context, target)
+            except (ValidationError, ValueError) as error:
+                if isinstance(error, ValidationError):
+                    details = "; ".join(
+                        f"{'.'.join(map(str, item['loc']))}: {item['msg']}"
+                        for item in error.errors(include_input=False, include_url=False)[:5]
+                    )
+                else:
+                    details = str(error)
+                if attempt == 2:
+                    raise GatewayError(
+                        "Model output failed validation after two correction attempts: "
+                        f"{details[:2000]} No report was published."
+                    ) from error
+                logger.warning(
+                    "Model output validation failed; requesting correction %s of 2: %s",
+                    attempt + 1, details[:2000],
+                )
+                request = json.loads(json.dumps(original_request))
+                request["messages"][1]["content"] = (
+                    "Your previous response failed backend validation. Regenerate the entire "
+                    "analysis using only the supplied batch. Do not copy or guess invalid "
+                    "citations. Copy provenance from Evidence_Source_Manifest, including exact "
+                    "worksheet names and original 1-based row numbers; use null for metadata "
+                    "absent from an artifact. Do not cite other batches. Keep Input_Context "
+                    "unchanged. If behavior lacks evidence, disclose that rather than inventing "
+                    "a citation. Validation error: " + details[:2000] + "\n"
+                    + original_request["messages"][1]["content"]
+                )
+                if sum(len(message["content"]) for message in request["messages"]) > self.settings.max_model_characters:
+                    raise GatewayError(
+                        "Model output failed validation and correction would exceed the context "
+                        f"limit: {details[:2000]} Reduce the analysis batch size."
+                    ) from error
+                body = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+                continue
+            if attempt:
+                analysis.warnings.append(
+                    "TIP regenerated a model batch after schema or evidence validation failed; "
+                    "the corrected response passed validation. Human review is still required."
+                )
+            return analysis
+        raise RuntimeError("Model validation loop ended without a result")
 
     def complete_json(
         self,

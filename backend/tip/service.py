@@ -632,7 +632,7 @@ class TaskManager:
                 break
 
             self.check(task_id)
-            validate_result(result, batch, context, options.target_application)
+            validate_result(result, batch, batch_context, options.target_application)
             return ("complete", (result, sum(len(item.content) for item in batch)))
 
         request_count_holder = [0]
