@@ -235,6 +235,32 @@ Every requirement must contain:
 
 Use null priority unless priority is explicitly supported by supplied evidence.
 
+When priority is explicitly supported by supplied evidence, the canonical
+requirement priority MUST be exactly one of these values:
+
+- "Must have"
+- "Should have"
+- "Nice to Have"
+
+These exact strings are required because canonical requirements are used
+directly to generate the qTest requirements workbook.
+
+Never emit alternative or abbreviated priority values such as:
+"Must", "Should", "Could", "High", "Medium", "Low",
+"Mandatory", "Optional", "Critical", or "Important".
+
+Do not infer priority from implementation complexity, UI placement,
+source-file location, implementation status, number of evidence references,
+or perceived business importance.
+
+If supplied evidence does not explicitly establish one of the supported
+qTest priority values, set priority to null.
+
+Do not guess or translate an unsupported priority value into a supported
+qTest priority. For example, evidence containing "Must" does NOT authorize
+changing it to "Must have"; use null unless the supplied evidence explicitly
+supports "Must have".
+
 Do not infer priority from implementation complexity, UI placement, source-file
 importance, frequency of references, or perceived business importance.
 
